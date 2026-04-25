@@ -1,5 +1,29 @@
 # mcp-server-omi: A OMI MCP server
 
+## PAI Local Mode
+
+This fork is part of **Pendant Nova** and replaces the omi.me cloud API with a
+local file-based store under PAI's `MEMORY/` tree. There is **no** network
+call, no API key, and no fallback to the omi.me cloud — by design, for
+privacy.
+
+- **Default root:** `~/.claude/MEMORY/PENDANT/`
+  - `memories/<uuid>.json` — one file per memory
+  - `conversations/YYYY-MM-DDTHH-MM-SS_<id>.json` — one file per conversation
+- **Override:** set `PAI_MEMORY_DIR=/some/other/path` (used by tests and for
+  alternate stores). The path is `expanduser`'d.
+- **Startup check:** the server hard-fails if the root directory is missing.
+  It will not silently create-and-use a different store and it will not call
+  the cloud.
+- **No API key required.** `OMI_API_KEY` and `OMI_API_BASE_URL` are ignored.
+- **Backend:** `mcp_server_omi.pai_memory` — all reads/writes happen there.
+
+The omi.me cloud branch has been removed from `server.py`; the MCP tool
+surface (`get_memories`, `create_memory`, `edit_memory`, `delete_memory`,
+`get_conversations`, `get_conversation_by_id`) is preserved.
+
+---
+
 ## Overview
 
 A Model Context Protocol server for Omi interaction and automation. This server provides tools to read, search, and manipulate Memories and Conversations.
