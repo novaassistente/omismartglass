@@ -187,7 +187,9 @@ static void ota_task(void *parameter) {
     }
 
     if (otaCancelled) {
+#if !PAI_LOCAL_MODE
         WiFi.disconnect(true);
+#endif
         ota_notify_status(OTA_STATUS_IDLE);
         otaTaskRunning = false;
         vTaskDelete(NULL);
@@ -196,7 +198,9 @@ static void ota_task(void *parameter) {
 
     // Step 2: Download and install firmware
     if (!download_and_install_firmware()) {
+#if !PAI_LOCAL_MODE
         WiFi.disconnect(true);
+#endif
         otaTaskRunning = false;
         vTaskDelete(NULL);
         return;
@@ -208,8 +212,10 @@ static void ota_task(void *parameter) {
     delay(2000);  // Give time for BLE notification to be sent
 
     Serial.println("OTA: Disconnecting WiFi...");
+#if !PAI_LOCAL_MODE
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+#endif
     delay(500);
 
     Serial.println("OTA: Rebooting now!");
@@ -220,6 +226,7 @@ static void ota_task(void *parameter) {
 }
 
 static bool connect_wifi() {
+#if !PAI_LOCAL_MODE
     Serial.printf("OTA: Connecting to WiFi: %s\n", wifiSSID);
     ota_notify_status(OTA_STATUS_WIFI_CONNECTING);
 
@@ -245,9 +252,19 @@ static bool connect_wifi() {
     Serial.printf("\nOTA: WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
     ota_notify_status(OTA_STATUS_WIFI_CONNECTED);
     return true;
+#else
+    Serial.println("OTA: WiFi disabled in PAI_LOCAL_MODE");
+    ota_notify_status(OTA_STATUS_WIFI_FAILED);
+    return false;
+#endif
 }
 
 static bool download_and_install_firmware() {
+#if PAI_LOCAL_MODE
+    Serial.println("OTA disabled in PAI_LOCAL_MODE");
+    ota_notify_status(OTA_STATUS_DOWNLOAD_FAILED);
+    return false;
+#else
     Serial.printf("OTA: Downloading firmware from: %s\n", firmwareURL);
     ota_notify_status(OTA_STATUS_DOWNLOADING, 0);
 
@@ -386,6 +403,7 @@ static bool download_and_install_firmware() {
     ota_notify_status(OTA_STATUS_INSTALL_COMPLETE, 100);
     delay(500);  // Give BLE time to send notification
     return true;
+#endif // !PAI_LOCAL_MODE
 }
 
 void ota_loop() {

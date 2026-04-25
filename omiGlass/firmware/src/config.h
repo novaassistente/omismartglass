@@ -2,6 +2,14 @@
 #define CONFIG_H
 
 // =============================================================================
+// PAI LOCAL MODE - Pendant Nova local-host pairing
+// =============================================================================
+// When 1, firmware boots BLE-only — no Wi-Fi auto-init, no OTA HTTP fetch.
+// The host pairing service handles transcription & inference.
+// Set to 0 to restore upstream cloud-app compatibility.
+#define PAI_LOCAL_MODE 1
+
+// =============================================================================
 // BOARD CONFIGURATION - Must be defined before camera includes
 // =============================================================================
 #define CAMERA_MODEL_XIAO_ESP32S3 // Define camera model for Seeed Xiao ESP32S3
