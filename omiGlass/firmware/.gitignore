@@ -1,0 +1,2 @@
+# Downloaded build-time helpers — re-fetched by scripts/provision_nvs.py
+scripts/nvs_partition_gen.py
