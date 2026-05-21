@@ -12,6 +12,8 @@
 #include "mic.h"
 #include "opus_encoder.h"
 #include "ota.h"
+#include "pai_nvs.h"
+#include "pai_wifi.h"
 
 // Battery state
 float batteryVoltage = 0.0f;
@@ -864,6 +866,17 @@ void setup_app()
 
     Serial.println("Setup complete.");
     Serial.println("Light sleep optimization enabled for extended battery life.");
+
+#if PAI_UPLOAD_MODE
+    // WiFi STA comes up AFTER BLE+camera+audio so radio coexistence is stable
+    // and the antenna is owned by BLE during the BLE-critical advertising
+    // window (ISC-8 boot order).
+    // begin()/suspend() instead of init()/pause() to avoid collision with
+    // Arduino's global init() and POSIX pause() symbols.
+    pai_nvs::begin();
+    pai_wifi::begin();
+    Serial.println("[WIFI] STA mode enabled (PAI_UPLOAD_MODE=1)");
+#endif
 }
 
 void loop_app()
