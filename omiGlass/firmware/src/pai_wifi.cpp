@@ -20,6 +20,7 @@
 #undef DISABLED
 #endif
 #include <algorithm>
+#include <atomic>
 #include <esp_event.h>
 #include <esp_mac.h>
 #include <esp_netif.h>
@@ -67,7 +68,10 @@ uint8_t s_active_profile = 0xFF;
 EventGroupHandle_t s_events = nullptr;
 TaskHandle_t s_task = nullptr;
 SemaphoreHandle_t s_scan_mutex = nullptr;
-bool s_paused = false;
+// s_paused is read on core 0 (task_main) and written on caller core (usually
+// core 1 via suspend/resume). std::atomic guarantees inter-core visibility
+// without taking the spinlock on every loop iteration.
+std::atomic<bool> s_paused{false};
 bool s_initialized = false;
 
 // -----------------------------------------------------------------------------
