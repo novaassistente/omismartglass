@@ -74,9 +74,12 @@ IPAddress get_ip();
 // Last known RSSI (0 if not connected).
 int8_t get_rssi();
 
-// Blocking scan. Returns up to `max_results` (SSID, RSSI) pairs, sorted by
-// RSSI descending. Timeout is hard — partial results returned on early exit.
+// Blocking scan. Returns (SSID, RSSI) pairs sorted by RSSI descending.
 // MUST NOT be called from the wifi task itself (will deadlock).
+///
+/// @param timeout_ms Maximum time to wait for the scan MUTEX (not the radio scan itself,
+///                   which runs ~4s fixed: 300ms × 13 channels). If 0, return immediately
+///                   if mutex is held.
 std::vector<std::pair<std::string, int8_t>> scan_blocking(uint32_t timeout_ms);
 
 } // namespace pai_wifi
