@@ -15,6 +15,20 @@
 //     then vfs_rename(.tmp -> .opus). Readers only ever return .opus files.
 //   * Boot-time scan in begin() unlinks any orphan .tmp files left by a
 //     previous power loss.
+//   * NOTE: LittleFS rename is atomic for the directory metadata block
+//     (lfs commits via CoW), but a power loss during the metadata commit
+//     itself can in the worst case lose BOTH the .tmp and target .opus
+//     entry. Net effect: bounded data loss of the in-flight chunk only,
+//     never silent corruption of a prior committed chunk. See
+//     /simplify-xhigh A-864/D-437 for the full failure model.
+//
+// Filename collision guard (post-/simplify-xhigh A-844/D-82/D-407):
+//   * s_boot_seq is a 14-bit counter (per chunk_id encoding); after 16384
+//     writes/boot it wraps. Combined with NTP wall-clock back-jump, this
+//     can produce a filename matching an existing pending chunk.
+//   * chunk_write pre-checks LittleFS.exists(opus_path) before rename and
+//     returns ESP_ERR_INVALID_STATE on collision — caller (S3 uploader)
+//     must retry. NEVER silently overwrites a pending chunk.
 //
 // Eviction (premortem S2-P4 — full filesystem):
 //   * Before each write, if chunks_pending_count() >= CHUNK_CAP_COUNT or

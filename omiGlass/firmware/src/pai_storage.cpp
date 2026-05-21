@@ -12,6 +12,7 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <atomic>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -43,11 +44,21 @@ constexpr size_t FULL_PATH_BUF_LEN = 64; // "/littlefs/chunks/" + FILENAME
 // -----------------------------------------------------------------------------
 // Shared state — protected by s_mutex
 // -----------------------------------------------------------------------------
+// Atomicity rationale (post-/simplify-xhigh fix, S2 review):
+//   * s_mounted: read on every chunk_* entry without lock — needs cross-core
+//     happens-before with begin() completion → acquire/release pair.
+//   * s_pending_count / s_evicted_lifetime: mutated under s_mutex but READ
+//     without it (by chunks_pending_count() / chunks_evicted_lifetime()
+//     observability getters). Plain size_t is C++ data race + cross-core
+//     visibility hole. Atomic with relaxed ordering is sufficient — readers
+//     don't need ordering vs other state, only single-variable freshness.
+//   * s_boot_seq: only mutated inside s_mutex by chunk_write, never read
+//     externally — plain uint type is fine.
 SemaphoreHandle_t s_mutex = nullptr;
-bool s_mounted = false;
-size_t s_pending_count = 0;
-size_t s_evicted_lifetime = 0;
-uint16_t s_boot_seq = 0; // monotonic per-boot sequence number
+std::atomic<bool> s_mounted{false};
+std::atomic<size_t> s_pending_count{0};
+std::atomic<size_t> s_evicted_lifetime{0};
+uint16_t s_boot_seq = 0; // monotonic per-boot sequence number, mutex-protected
 
 // -----------------------------------------------------------------------------
 // Mutex RAII guard — releases on scope exit, including error paths
@@ -183,6 +194,14 @@ bool scan_chunks_dir(size_t *out_opus_count, size_t *out_tmp_scrubbed)
         return false;
     }
 
+    // Two-pass to avoid LittleFS dir-iterator invalidation when removing
+    // entries mid-walk (per /simplify-xhigh A-204 — lfs_dir_read behavior is
+    // undefined when the underlying directory is mutated during iteration).
+    // Pass 1: enumerate. Pass 2: delete collected .tmp orphans after dir.close().
+    constexpr size_t MAX_TMP_ORPHANS = 32; // bounded — extras handled on next boot
+    char orphan_paths[MAX_TMP_ORPHANS][FULL_PATH_BUF_LEN] = {};
+    size_t orphan_count = 0;
+
     File entry = dir.openNextFile();
     while (entry) {
         const char *full = entry.name(); // returns "/littlefs/chunks/xxx" or "xxx" depending on core ver
@@ -197,16 +216,13 @@ bool scan_chunks_dir(size_t *out_opus_count, size_t *out_tmp_scrubbed)
         bool ok = parse_filename(leaf, &ts_ms, &seq, &is_tmp);
         if (ok) {
             if (is_tmp) {
-                // Premortem S2-P3 recovery: scrub orphan .tmp from power-loss.
-                char path[FULL_PATH_BUF_LEN];
-                if (build_full_path(leaf, path, sizeof(path))) {
-                    entry.close();
-                    if (LittleFS.remove(path) && out_tmp_scrubbed != nullptr) {
-                        ++(*out_tmp_scrubbed);
+                // Premortem S2-P3 recovery: queue orphan .tmp for post-walk scrub.
+                if (orphan_count < MAX_TMP_ORPHANS) {
+                    if (build_full_path(leaf, orphan_paths[orphan_count], FULL_PATH_BUF_LEN)) {
+                        ++orphan_count;
                     }
-                    entry = dir.openNextFile();
-                    continue;
                 }
+                // else: bounded buffer — drop, will scrub on next boot
             } else if (out_opus_count != nullptr) {
                 ++(*out_opus_count);
             }
@@ -215,6 +231,13 @@ bool scan_chunks_dir(size_t *out_opus_count, size_t *out_tmp_scrubbed)
         entry = dir.openNextFile();
     }
     dir.close();
+
+    // Pass 2: dir handle released, safe to mutate.
+    for (size_t i = 0; i < orphan_count; ++i) {
+        if (LittleFS.remove(orphan_paths[i]) && out_tmp_scrubbed != nullptr) {
+            ++(*out_tmp_scrubbed);
+        }
+    }
     return true;
 }
 
@@ -284,10 +307,10 @@ bool evict_oldest_unlocked()
     if (!LittleFS.remove(path)) {
         return false;
     }
-    if (s_pending_count > 0) {
-        --s_pending_count;
+    if (s_pending_count.load(std::memory_order_relaxed) > 0) {
+        s_pending_count.fetch_sub(1, std::memory_order_relaxed);
     }
-    ++s_evicted_lifetime;
+    s_evicted_lifetime.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -321,10 +344,17 @@ bool ensure_chunks_dir()
 // -----------------------------------------------------------------------------
 esp_err_t begin()
 {
-    if (s_mounted) {
+    // Fast path — already mounted. Acquire fence pairs with the release store
+    // at the end of a prior begin() call, guaranteeing the caller observes
+    // a fully-initialized FS (mount + scrub + counter set).
+    if (s_mounted.load(std::memory_order_acquire)) {
         return ESP_OK;
     }
 
+    // Lazy mutex creation is NOT thread-safe by itself, but begin() is invoked
+    // exactly once from setup_app() during single-threaded boot — by contract,
+    // no second caller exists at this point. The double-check inside the lock
+    // below defends against any future violation of that invariant.
     if (s_mutex == nullptr) {
         s_mutex = xSemaphoreCreateMutex();
         if (s_mutex == nullptr) {
@@ -350,6 +380,13 @@ esp_err_t begin()
         return ESP_ERR_INVALID_STATE;
     }
 
+    // Re-check under the lock — defense vs concurrent begin() callers
+    // (per /simplify-xhigh A-785/D-324). First winner does the work, others
+    // see ESP_OK without re-mounting.
+    if (s_mounted.load(std::memory_order_relaxed)) {
+        return ESP_OK;
+    }
+
     if (!ensure_chunks_dir()) {
         Serial.println("[STORAGE] mkdir /chunks failed");
         return ESP_FAIL;
@@ -362,13 +399,15 @@ esp_err_t begin()
         // Dir open failed despite mkdir success — treat as empty but log.
         Serial.println("[STORAGE] dir scan failed at boot");
     }
-    s_pending_count = opus_count;
+    s_pending_count.store(opus_count, std::memory_order_relaxed);
 
     if (tmp_scrubbed > 0) {
         Serial.printf("[STORAGE] scrubbed %u orphan .tmp files\n", (unsigned) tmp_scrubbed);
     }
 
-    s_mounted = true;
+    // Release fence — ensures any post-begin() loader sees the FS in its
+    // fully-initialized state (mount + scrub + counter set).
+    s_mounted.store(true, std::memory_order_release);
     return ESP_OK;
 }
 
@@ -377,7 +416,7 @@ esp_err_t chunk_write(const uint8_t *buf, size_t len, uint64_t *out_chunk_id)
     if (buf == nullptr || len == 0 || len > CHUNK_MAX_BYTES) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!s_mounted) {
+    if (!s_mounted.load(std::memory_order_acquire)) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -391,7 +430,7 @@ esp_err_t chunk_write(const uint8_t *buf, size_t len, uint64_t *out_chunk_id)
     // filesystem (defensive: should converge in at most a handful of evictions).
     constexpr size_t MAX_EVICT_PER_WRITE = 8;
     for (size_t i = 0; i < MAX_EVICT_PER_WRITE; ++i) {
-        bool need_count = s_pending_count >= CHUNK_CAP_COUNT;
+        bool need_count = s_pending_count.load(std::memory_order_relaxed) >= CHUNK_CAP_COUNT;
         bool need_free = below_free_floor();
         if (!need_count && !need_free) {
             break;
@@ -434,13 +473,27 @@ esp_err_t chunk_write(const uint8_t *buf, size_t len, uint64_t *out_chunk_id)
         return ESP_ERR_NO_MEM;
     }
 
-    // Atomic rename .tmp → .opus
+    // Collision guard (per /simplify-xhigh A-844/D-82/D-407): seq wrap at 16384
+    // writes/boot OR NTP wall-clock back-jump can produce a filename that
+    // collides with an existing pending chunk. Refuse to overwrite — caller
+    // (S3 uploader) retries on ESP_ERR_INVALID_STATE. Without this guard
+    // LittleFS.rename would silently clobber a not-yet-uploaded chunk and
+    // s_pending_count would drift from actual on-disk count.
+    if (LittleFS.exists(opus_path)) {
+        LittleFS.remove(tmp_path);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Rename .tmp → .opus. NOTE: LittleFS rename is atomic for the directory
+    // metadata block (lfs guarantees), but the underlying CoW write can still
+    // be interrupted by power loss — in the worst case both files vanish.
+    // See /simplify A-864 + D-437 for the bounded-loss premortem.
     if (!LittleFS.rename(tmp_path, opus_path)) {
         LittleFS.remove(tmp_path);
         return ESP_FAIL;
     }
 
-    ++s_pending_count;
+    s_pending_count.fetch_add(1, std::memory_order_relaxed);
     if (out_chunk_id != nullptr) {
         *out_chunk_id = encode_id(ts_ms, seq);
     }
@@ -452,7 +505,7 @@ esp_err_t chunk_read_next(uint8_t *buf, size_t max_len, size_t *out_len, uint64_
     if (buf == nullptr || out_len == nullptr || out_id == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!s_mounted) {
+    if (!s_mounted.load(std::memory_order_acquire)) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -493,7 +546,7 @@ esp_err_t chunk_read_next(uint8_t *buf, size_t max_len, size_t *out_len, uint64_
 
 esp_err_t chunk_delete(uint64_t chunk_id)
 {
-    if (!s_mounted) {
+    if (!s_mounted.load(std::memory_order_acquire)) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -522,23 +575,25 @@ esp_err_t chunk_delete(uint64_t chunk_id)
     if (!LittleFS.remove(path)) {
         return ESP_FAIL;
     }
-    if (s_pending_count > 0) {
-        --s_pending_count;
+    if (s_pending_count.load(std::memory_order_relaxed) > 0) {
+        s_pending_count.fetch_sub(1, std::memory_order_relaxed);
     }
     return ESP_OK;
 }
 
 size_t chunks_pending_count()
 {
-    // Single word read of a cached counter — no lock needed on Xtensa LX7
-    // (aligned word load is atomic). The mutator paths inside chunk_write /
-    // chunk_delete are mutex-protected against each other.
-    return s_pending_count;
+    // Lock-free observability read (per /simplify-xhigh A-973/D-536/E-970).
+    // std::atomic<size_t> with relaxed load — observability getters don't need
+    // ordering vs other state, only single-variable freshness. Mutator paths
+    // inside chunk_write / chunk_delete / evict_oldest_unlocked are still
+    // mutex-protected against each other for compound state consistency.
+    return s_pending_count.load(std::memory_order_relaxed);
 }
 
 size_t chunks_evicted_lifetime()
 {
-    return s_evicted_lifetime;
+    return s_evicted_lifetime.load(std::memory_order_relaxed);
 }
 
 } // namespace pai_storage
