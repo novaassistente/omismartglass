@@ -23,6 +23,59 @@ constexpr const char *KEY_ENDPOINT = "upload_endpoint";
 
 bool s_initialized = false;
 
+// RAII guard for an NVS handle: opens in the constructor, closes in the
+// destructor on EVERY path (including exceptions and early returns). Move
+// semantics allowed; copies forbidden to avoid double-close on the same
+// handle.
+class NvsHandle
+{
+public:
+    NvsHandle(const char *ns, nvs_open_mode_t mode) : h_(0), open_err_(ESP_FAIL), owns_(false)
+    {
+        open_err_ = nvs_open(ns, mode, &h_);
+        owns_ = (open_err_ == ESP_OK);
+    }
+    ~NvsHandle() { close(); }
+
+    NvsHandle(const NvsHandle &) = delete;
+    NvsHandle &operator=(const NvsHandle &) = delete;
+
+    NvsHandle(NvsHandle &&other) noexcept : h_(other.h_), open_err_(other.open_err_), owns_(other.owns_)
+    {
+        other.h_ = 0;
+        other.owns_ = false;
+    }
+    NvsHandle &operator=(NvsHandle &&other) noexcept
+    {
+        if (this != &other) {
+            close();
+            h_ = other.h_;
+            open_err_ = other.open_err_;
+            owns_ = other.owns_;
+            other.h_ = 0;
+            other.owns_ = false;
+        }
+        return *this;
+    }
+
+    bool ok() const { return open_err_ == ESP_OK && owns_; }
+    esp_err_t err() const { return open_err_; }
+    nvs_handle_t handle() const { return h_; }
+
+    void close()
+    {
+        if (owns_) {
+            nvs_close(h_);
+            owns_ = false;
+        }
+    }
+
+private:
+    nvs_handle_t h_;
+    esp_err_t open_err_;
+    bool owns_;
+};
+
 // Build a key name for profile `idx` into `out`. Returns false if idx >= PROFILE_COUNT.
 bool build_profile_key(const char *prefix, uint8_t idx, char *out, size_t out_max)
 {
@@ -83,13 +136,14 @@ esp_err_t begin()
     }
 
     // Quickly verify the namespace exists by opening read-only.
-    nvs_handle_t h;
-    err = nvs_open(NAMESPACE, NVS_READONLY, &h);
-    if (err == ESP_OK) {
-        nvs_close(h);
-        s_initialized = true;
-        Serial.println("[NVS] pn_wifi namespace ready");
-        return ESP_OK;
+    {
+        NvsHandle h(NAMESPACE, NVS_READONLY);
+        if (h.ok()) {
+            s_initialized = true;
+            Serial.println("[NVS] pn_wifi namespace ready");
+            return ESP_OK;
+        }
+        err = h.err();
     }
 
     // Common case on a fresh device: namespace not yet provisioned.
@@ -122,32 +176,27 @@ esp_err_t get_profile(uint8_t idx, char *ssid, size_t ssid_max, char *psk, size_
         }
     }
 
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(NAMESPACE, NVS_READONLY, &h);
-    if (err != ESP_OK) {
-        return err;
+    NvsHandle h(NAMESPACE, NVS_READONLY);
+    if (!h.ok()) {
+        return h.err();
     }
 
     char key[16];
     if (!build_profile_key("ssid", idx, key, sizeof(key))) {
-        nvs_close(h);
         return ESP_ERR_INVALID_ARG;
     }
-    err = read_string(h, key, ssid, ssid_max);
+    esp_err_t err = read_string(h.handle(), key, ssid, ssid_max);
     if (err != ESP_OK) {
-        nvs_close(h);
         memset(psk, 0, psk_max);
         return err;
     }
 
     if (!build_profile_key("psk", idx, key, sizeof(key))) {
-        nvs_close(h);
         memset(ssid, 0, ssid_max);
         memset(psk, 0, psk_max);
         return ESP_ERR_INVALID_ARG;
     }
-    err = read_string(h, key, psk, psk_max);
-    nvs_close(h);
+    err = read_string(h.handle(), key, psk, psk_max);
     if (err != ESP_OK) {
         // Wipe both buffers — half-loaded profile is worse than nothing.
         memset(ssid, 0, ssid_max);
@@ -167,20 +216,18 @@ bool has_profile(uint8_t idx)
         }
     }
 
-    nvs_handle_t h;
-    if (nvs_open(NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+    NvsHandle h(NAMESPACE, NVS_READONLY);
+    if (!h.ok()) {
         return false;
     }
 
     char key[16];
     if (!build_profile_key("ssid", idx, key, sizeof(key))) {
-        nvs_close(h);
         return false;
     }
 
     size_t required = 0;
-    esp_err_t err = nvs_get_str(h, key, nullptr, &required);
-    nvs_close(h);
+    esp_err_t err = nvs_get_str(h.handle(), key, nullptr, &required);
     return (err == ESP_OK) && (required > 1); // > 1 == at least one char + NUL
 }
 
@@ -198,15 +245,13 @@ esp_err_t get_upload_token(uint8_t buf[UPLOAD_TOKEN_LEN])
         }
     }
 
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(NAMESPACE, NVS_READONLY, &h);
-    if (err != ESP_OK) {
-        return err;
+    NvsHandle h(NAMESPACE, NVS_READONLY);
+    if (!h.ok()) {
+        return h.err();
     }
 
     size_t required = UPLOAD_TOKEN_LEN;
-    err = nvs_get_blob(h, KEY_TOKEN, buf, &required);
-    nvs_close(h);
+    esp_err_t err = nvs_get_blob(h.handle(), KEY_TOKEN, buf, &required);
 
     if (err != ESP_OK || required != UPLOAD_TOKEN_LEN) {
         memset(buf, 0, UPLOAD_TOKEN_LEN);
@@ -229,14 +274,11 @@ esp_err_t get_upload_endpoint(char *buf, size_t max)
         }
     }
 
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(NAMESPACE, NVS_READONLY, &h);
-    if (err != ESP_OK) {
-        return err;
+    NvsHandle h(NAMESPACE, NVS_READONLY);
+    if (!h.ok()) {
+        return h.err();
     }
-    err = read_string(h, KEY_ENDPOINT, buf, max);
-    nvs_close(h);
-    return err;
+    return read_string(h.handle(), KEY_ENDPOINT, buf, max);
 }
 
 } // namespace pai_nvs
