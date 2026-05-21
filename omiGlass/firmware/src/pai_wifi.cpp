@@ -60,8 +60,14 @@ constexpr EventBits_t BIT_RESUME_REQ = BIT4;
 // -----------------------------------------------------------------------------
 portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 State s_state = State::INIT;
-uint32_t s_ip_raw = 0;
-int8_t s_rssi = 0;
+// s_ip_raw and s_rssi are read on hot paths (e.g. status callbacks from
+// any core) and written only by the wifi event handler. Xtensa LX7 aligned
+// 32-bit and 8-bit loads/stores are atomic at the ISA level, so std::atomic
+// gives us the right C++ memory ordering guarantees without taking the
+// spinlock on every getter call. Writers still use the spinlock for
+// cross-field consistency with s_state.
+std::atomic<uint32_t> s_ip_raw{0};
+std::atomic<int8_t> s_rssi{0};
 uint8_t s_disconnect_reason = 0;
 uint8_t s_active_profile = 0xFF;
 
@@ -87,14 +93,14 @@ void set_state(State s)
 void set_ip(uint32_t raw)
 {
     portENTER_CRITICAL(&s_mux);
-    s_ip_raw = raw;
+    s_ip_raw.store(raw, std::memory_order_relaxed);
     portEXIT_CRITICAL(&s_mux);
 }
 
 void set_rssi(int8_t r)
 {
     portENTER_CRITICAL(&s_mux);
-    s_rssi = r;
+    s_rssi.store(r, std::memory_order_relaxed);
     portEXIT_CRITICAL(&s_mux);
 }
 
@@ -256,8 +262,9 @@ bool try_profile(uint8_t idx)
     if (bits & BIT_GOT_IP) {
         // SSID is intentionally absent from this log. idx allows operator to
         // correlate without exposing the AP name.
-        IPAddress ip(s_ip_raw);
-        Serial.printf("[WIFI] connected idx=%u ip=%s rssi=%d\n", (unsigned) idx, ip.toString().c_str(), (int) s_rssi);
+        IPAddress ip(s_ip_raw.load(std::memory_order_relaxed));
+        Serial.printf("[WIFI] connected idx=%u ip=%s rssi=%d\n", (unsigned) idx, ip.toString().c_str(),
+                      (int) s_rssi.load(std::memory_order_relaxed));
         set_state(State::CONNECTED);
         return true;
     }
@@ -473,20 +480,16 @@ bool is_connected()
 
 IPAddress get_ip()
 {
-    uint32_t raw;
-    portENTER_CRITICAL(&s_mux);
-    raw = s_ip_raw;
-    portEXIT_CRITICAL(&s_mux);
-    return IPAddress(raw);
+    // Aligned word load is atomic on Xtensa LX7; std::atomic gives us the
+    // C++ memory ordering guarantee without taking the spinlock. Premortem
+    // S1-P8: torn reads cannot occur for 32-bit aligned word loads.
+    return IPAddress(s_ip_raw.load(std::memory_order_relaxed));
 }
 
 int8_t get_rssi()
 {
-    int8_t r;
-    portENTER_CRITICAL(&s_mux);
-    r = s_rssi;
-    portEXIT_CRITICAL(&s_mux);
-    return r;
+    // Aligned byte load is atomic on Xtensa LX7. See get_ip() comment.
+    return s_rssi.load(std::memory_order_relaxed);
 }
 
 std::vector<std::pair<std::string, int8_t>> scan_blocking(uint32_t timeout_ms)
