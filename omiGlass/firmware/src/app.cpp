@@ -13,6 +13,7 @@
 #include "opus_encoder.h"
 #include "ota.h"
 #include "pai_nvs.h"
+#include "pai_storage.h"
 #include "pai_wifi.h"
 
 // Battery state
@@ -874,6 +875,19 @@ void setup_app()
     // begin()/suspend() instead of init()/pause() to avoid collision with
     // Arduino's global init() and POSIX pause() symbols.
     pai_nvs::begin();
+
+    // LittleFS chunk store — mount BEFORE bringing wifi up so the upload
+    // pipeline has its persistent queue ready when STA connects (S2 premortem
+    // P7: also keeps the FS init off the BLE advertising critical path).
+    esp_err_t storage_err = pai_storage::begin();
+    if (storage_err == ESP_OK) {
+        Serial.printf("[STORAGE] OK pending=%u evicted_lifetime=%u\n",
+                      (unsigned) pai_storage::chunks_pending_count(),
+                      (unsigned) pai_storage::chunks_evicted_lifetime());
+    } else {
+        Serial.printf("[STORAGE] mount failed err=0x%x\n", storage_err);
+    }
+
     pai_wifi::begin();
     Serial.println("[WIFI] STA mode enabled (PAI_UPLOAD_MODE=1)");
 #endif
