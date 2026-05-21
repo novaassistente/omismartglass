@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import glob
 import os
 import re
 import stat
@@ -45,6 +44,10 @@ import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+# Local helper — single source of truth for serial port discovery.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _serial_port import autodetect_port  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants matching the firmware schema (pai_nvs.h)
@@ -235,24 +238,6 @@ def generate_partition(
         if result.stderr:
             print(result.stderr, file=sys.stderr)
         sys.exit(2)
-
-
-# ---------------------------------------------------------------------------
-# Port auto-detect
-# ---------------------------------------------------------------------------
-def autodetect_port() -> str:
-    # macOS
-    candidates = sorted(glob.glob("/dev/cu.usbmodem*"))
-    if candidates:
-        return candidates[0]
-    # Linux
-    for pat in ("/dev/ttyACM*", "/dev/ttyUSB*"):
-        candidates = sorted(glob.glob(pat))
-        if candidates:
-            return candidates[0]
-    raise RuntimeError(
-        "no serial port auto-detected; pass --port /dev/<your-port>"
-    )
 
 
 # ---------------------------------------------------------------------------

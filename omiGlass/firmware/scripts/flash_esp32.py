@@ -7,31 +7,17 @@ This script helps flash firmware to an ESP32 S3 XIAO board using PlatformIO
 import os
 import sys
 import time
-import glob
 import subprocess
-import platform
+from pathlib import Path
+
+# Local helper — single source of truth for serial port discovery.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _serial_port import list_serial_ports  # noqa: E402
+
 
 def find_serial_ports():
-    """Find available serial ports"""
-    system = platform.system()
-    ports = []
-    
-    if system == 'Darwin':  # macOS
-        ports = glob.glob('/dev/tty.*') + glob.glob('/dev/cu.*')
-        # Filter for likely ESP32 devices
-        ports = [p for p in ports if any(x in p.lower() for x in ['usb', 'wchusb', 'slab', 'cp210', 'acm'])]
-    elif system == 'Linux':
-        ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-    elif system == 'Windows':
-        # Requires pyserial to be installed
-        try:
-            import serial.tools.list_ports
-            ports = [p.device for p in serial.tools.list_ports.comports()]
-        except ImportError:
-            print("pyserial not found. On Windows, install it with: pip install pyserial")
-            ports = ['COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8']
-    
-    return ports
+    """Find available serial ports (delegates to _serial_port.list_serial_ports)."""
+    return list_serial_ports()
 
 def check_platformio():
     """Check if PlatformIO is installed"""
