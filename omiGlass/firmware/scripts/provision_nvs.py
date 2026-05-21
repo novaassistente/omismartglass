@@ -193,6 +193,7 @@ def build_csv(env: Dict[str, str], csv_path: Path, token_bin_path: Path) -> None
         os.close(fd)
 
     rows: List[List[str]] = [
+        ["key", "type", "encoding", "value"],
         [NVS_NAMESPACE, "namespace", "", ""],
         ["ssid_0", "data", "string", env["WIFI_SSID_0"]],
         ["psk_0", "data", "string", env["WIFI_PSK_0"]],
