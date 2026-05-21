@@ -9,6 +9,12 @@
 // Set to 0 to restore upstream cloud-app compatibility.
 #define PAI_LOCAL_MODE 1
 
+// PAI_UPLOAD_MODE: enable WiFi STA for chunk upload. Default 1.
+// Set to 0 to compile BLE-only firmware (dev/debug).
+#ifndef PAI_UPLOAD_MODE
+#define PAI_UPLOAD_MODE 1
+#endif
+
 // =============================================================================
 // BOARD CONFIGURATION - Must be defined before camera includes
 // =============================================================================
