@@ -239,17 +239,23 @@ static bool poison_chunk(uint64_t chunk_id)
     return false;
 }
 
-// Read NVS cadence; fall back to default and clamp to MIN_TICK_MS.
-// NB: pai_nvs does NOT today expose a generic u32 getter. We accept
-// that and use DEFAULT_TICK_MS until S1 follow-up adds the slot.
-// Clamp guarantees safety in the meantime.
+// Read NVS cadence; fall back to DEFAULT_TICK_MS on any error and clamp
+// to MIN_TICK_MS. A misconfigured slot (too-low value) is silently raised
+// to MIN_TICK_MS so a typo can never tight-loop the server. Missing slot
+// is the common case on devices provisioned before S3 — falls back to
+// DEFAULT_TICK_MS without logging at error level.
 static uint32_t read_tick_ms()
 {
-    // TODO(S1-next): add pai_nvs::get_upload_tick_ms() and call here.
-    // For now: literal default. The MIN clamp below is the safety
-    // net regardless of source.
-    uint32_t v = DEFAULT_TICK_MS;
+    uint32_t v = 0;
+    esp_err_t err = pai_nvs::get_upload_tick_ms(&v);
+    if (err != ESP_OK || v == 0) {
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            Serial.printf("[UPLOAD] upload_tick_ms read err=0x%x — using default\n", (unsigned) err);
+        }
+        v = DEFAULT_TICK_MS;
+    }
     if (v < MIN_TICK_MS) {
+        Serial.printf("[UPLOAD] upload_tick_ms=%u below MIN — clamping to %u\n", (unsigned) v, (unsigned) MIN_TICK_MS);
         v = MIN_TICK_MS;
     }
     return v;

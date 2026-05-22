@@ -205,6 +205,19 @@ def build_csv(env: Dict[str, str], csv_path: Path, token_bin_path: Path) -> None
         ["upload_token", "file", "binary", str(token_bin_path)],
         ["upload_endpoint", "data", "string", env["PENDANT_UPLOAD_ENDPOINT"]],
     ]
+    # Optional D2 cadence override. Absent → firmware uses DEFAULT_TICK_MS
+    # (15 min). Value clamped to MIN_TICK_MS (30 s) at runtime regardless
+    # of provisioned value so a typo can never tight-loop the server.
+    tick_ms_str = env.get("PENDANT_UPLOAD_TICK_MS", "").strip()
+    if tick_ms_str:
+        try:
+            tick_ms_val = int(tick_ms_str, 10)
+            if tick_ms_val < 0 or tick_ms_val > 0xFFFFFFFF:
+                raise ValueError(f"out of u32 range: {tick_ms_val}")
+        except ValueError as e:
+            print(f"ERROR PENDANT_UPLOAD_TICK_MS invalid: {e}", file=sys.stderr)
+            sys.exit(2)
+        rows.append(["upload_tick", "data", "u32", str(tick_ms_val)])
 
     # csv_path mode 0600 — contains plaintext PSK.
     fd = os.open(csv_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

@@ -20,6 +20,7 @@ namespace
 constexpr const char *NAMESPACE = "pn_wifi";
 constexpr const char *KEY_TOKEN = "upload_token";
 constexpr const char *KEY_ENDPOINT = "upload_endpoint";
+constexpr const char *KEY_TICK_MS = "upload_tick";
 
 bool s_initialized = false;
 
@@ -29,13 +30,16 @@ bool s_initialized = false;
 // handle.
 class NvsHandle
 {
-public:
+  public:
     NvsHandle(const char *ns, nvs_open_mode_t mode) : h_(0), open_err_(ESP_FAIL), owns_(false)
     {
         open_err_ = nvs_open(ns, mode, &h_);
         owns_ = (open_err_ == ESP_OK);
     }
-    ~NvsHandle() { close(); }
+    ~NvsHandle()
+    {
+        close();
+    }
 
     NvsHandle(const NvsHandle &) = delete;
     NvsHandle &operator=(const NvsHandle &) = delete;
@@ -58,9 +62,18 @@ public:
         return *this;
     }
 
-    bool ok() const { return open_err_ == ESP_OK && owns_; }
-    esp_err_t err() const { return open_err_; }
-    nvs_handle_t handle() const { return h_; }
+    bool ok() const
+    {
+        return open_err_ == ESP_OK && owns_;
+    }
+    esp_err_t err() const
+    {
+        return open_err_;
+    }
+    nvs_handle_t handle() const
+    {
+        return h_;
+    }
 
     void close()
     {
@@ -70,7 +83,7 @@ public:
         }
     }
 
-private:
+  private:
     nvs_handle_t h_;
     esp_err_t open_err_;
     bool owns_;
@@ -279,6 +292,34 @@ esp_err_t get_upload_endpoint(char *buf, size_t max)
         return h.err();
     }
     return read_string(h.handle(), KEY_ENDPOINT, buf, max);
+}
+
+esp_err_t get_upload_tick_ms(uint32_t *out)
+{
+    if (out == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out = 0;
+
+    if (!s_initialized) {
+        esp_err_t err = begin();
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    NvsHandle h(NAMESPACE, NVS_READONLY);
+    if (!h.ok()) {
+        return h.err();
+    }
+    uint32_t v = 0;
+    esp_err_t err = nvs_get_u32(h.handle(), KEY_TICK_MS, &v);
+    if (err != ESP_OK) {
+        *out = 0;
+        return err;
+    }
+    *out = v;
+    return ESP_OK;
 }
 
 } // namespace pai_nvs

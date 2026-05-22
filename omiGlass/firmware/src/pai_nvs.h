@@ -11,6 +11,7 @@
 //   psk_1            string  max 64 bytes
 //   upload_token     blob    32 bytes (HMAC key)
 //   upload_endpoint  string  max 128 bytes (null-terminated URL)
+//   upload_tick_ms   u32     4 bytes (D2 cadence override; absent → caller default)
 //
 // Security invariants:
 //   * Firmware NEVER writes to this namespace at runtime (ISC-A7).
@@ -67,6 +68,13 @@ esp_err_t get_upload_token(uint8_t buf[UPLOAD_TOKEN_LEN]);
 
 // Read upload endpoint URL (null-terminated). `buf` is zeroed before read.
 esp_err_t get_upload_endpoint(char *buf, size_t max);
+
+// Read D2 cadence override (uint32 milliseconds) into *out. On success
+// *out holds the provisioned value and ESP_OK is returned. On missing
+// key returns ESP_ERR_NVS_NOT_FOUND and *out is set to 0 — caller is
+// expected to substitute its own DEFAULT_TICK_MS. Any other error
+// returns the underlying esp_err_t with *out zeroed.
+esp_err_t get_upload_tick_ms(uint32_t *out);
 
 } // namespace pai_nvs
 
