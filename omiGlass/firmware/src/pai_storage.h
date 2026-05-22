@@ -63,14 +63,19 @@ namespace pai_storage
 // safety margin. This is the PRIMARY eviction gate per D4. The count and
 // percent caps below remain as defense-in-depth.
 //
-// D5 specified "chunk rotation 60 s OR 240 KiB". REC task (scheduled for next
-// session) MUST call chunk_write at MOST every CHUNK_ROTATE_INTERVAL_MS milli-
-// seconds OR after accumulating CHUNK_ROTATE_BYTES of encoded Opus, whichever
-// comes first. These are pure caller-side policy hooks — pai_storage itself
-// only enforces per-chunk atomicity.
+// D5 specified "chunk rotation 60 s OR 240 KiB". The 240 KiB target was the
+// CONCEPT-level rotation cadence (~60 s of Opus at 24 kbps). In practice the
+// physical per-chunk write is bounded by CHUNK_MAX_BYTES below (16 KiB ≈ 4 s
+// of Opus) so pai_storage::chunk_write rejects payloads above that with
+// ESP_ERR_INVALID_ARG. Reconciling CHUNK_ROTATE_BYTES down to CHUNK_MAX_BYTES
+// honours D5's "OR 240 KiB" intent (rotate small) while keeping per-chunk
+// memory budget bounded — and incidentally improves D4 loss granularity
+// (a dropped chunk loses ~4 s, not ~60 s). The 60 s interval still drives the
+// soft rotation cadence when audio activity is light. REC task callers
+// (pai_rec, s2.5) MUST rotate at the SMALLER of these two thresholds.
 static constexpr size_t CHUNK_CAP_BYTES = 4u * 1024u * 1024u;     // D4 primary
-static constexpr uint32_t CHUNK_ROTATE_INTERVAL_MS = 60u * 1000u;  // D5
-static constexpr size_t CHUNK_ROTATE_BYTES = 240u * 1024u;         // D5
+static constexpr uint32_t CHUNK_ROTATE_INTERVAL_MS = 60u * 1000u; // D5 interval
+static constexpr size_t CHUNK_ROTATE_BYTES = 16u * 1024u;         // D5 reconciled to CHUNK_MAX_BYTES
 
 // Defense-in-depth: count cap (D4 secondary). At 4 s/chunk × 256 chunks ≈
 // 17 min of buffered audio in the worst case. Bytes cap usually trips first.
