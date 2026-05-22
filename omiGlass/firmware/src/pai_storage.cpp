@@ -327,6 +327,16 @@ bool below_free_floor()
     return free_bytes * 100 < total * (size_t) CHUNK_CAP_FREE_PCT;
 }
 
+// D4 primary gate: returns true if total bytes used by chunks exceed
+// CHUNK_CAP_BYTES. Uses LittleFS.usedBytes() which includes metadata; for
+// pendant workload (large append-only files) this is close enough to chunk-
+// byte total without an O(N) per-write scan.
+bool bytes_over_cap()
+{
+    size_t used = LittleFS.usedBytes();
+    return used >= CHUNK_CAP_BYTES;
+}
+
 // Ensure /littlefs/chunks/ exists. Returns false on hard failure.
 bool ensure_chunks_dir()
 {
@@ -429,10 +439,14 @@ esp_err_t chunk_write(const uint8_t *buf, size_t len, uint64_t *out_chunk_id)
     // We bound eviction iterations to avoid pathological loops on a corrupt
     // filesystem (defensive: should converge in at most a handful of evictions).
     constexpr size_t MAX_EVICT_PER_WRITE = 8;
+    // Eviction gates (per architecture D4): primary = bytes_over_cap (4 MiB
+    // hard cap), secondary defense-in-depth = count cap and free-space
+    // watermark. Whichever trips first triggers DROP OLDEST FIFO.
     for (size_t i = 0; i < MAX_EVICT_PER_WRITE; ++i) {
+        bool need_bytes = bytes_over_cap();
         bool need_count = s_pending_count.load(std::memory_order_relaxed) >= CHUNK_CAP_COUNT;
         bool need_free = below_free_floor();
-        if (!need_count && !need_free) {
+        if (!need_bytes && !need_count && !need_free) {
             break;
         }
         if (!evict_oldest_unlocked()) {

@@ -55,13 +55,30 @@
 namespace pai_storage
 {
 
-// Maximum number of pending .opus chunks before eviction kicks in.
-// At 4 s/chunk × 256 chunks ≈ 17 min of buffered audio in the worst case.
+// =============================================================================
+// Architecture decisions D4/D5 alignment (project_pendant_architecture_decisions_locked_2026-05-21)
+// =============================================================================
+// D4 specified "6MB cap DROP OLDEST". Actual partition is 4.94 MiB so the
+// honest byte cap below is 4 MiB — leaves ~960 KiB for LittleFS metadata and
+// safety margin. This is the PRIMARY eviction gate per D4. The count and
+// percent caps below remain as defense-in-depth.
+//
+// D5 specified "chunk rotation 60 s OR 240 KiB". REC task (scheduled for next
+// session) MUST call chunk_write at MOST every CHUNK_ROTATE_INTERVAL_MS milli-
+// seconds OR after accumulating CHUNK_ROTATE_BYTES of encoded Opus, whichever
+// comes first. These are pure caller-side policy hooks — pai_storage itself
+// only enforces per-chunk atomicity.
+static constexpr size_t CHUNK_CAP_BYTES = 4u * 1024u * 1024u;     // D4 primary
+static constexpr uint32_t CHUNK_ROTATE_INTERVAL_MS = 60u * 1000u;  // D5
+static constexpr size_t CHUNK_ROTATE_BYTES = 240u * 1024u;         // D5
+
+// Defense-in-depth: count cap (D4 secondary). At 4 s/chunk × 256 chunks ≈
+// 17 min of buffered audio in the worst case. Bytes cap usually trips first.
 static constexpr size_t CHUNK_CAP_COUNT = 256;
 
-// When free space drops below this fraction of partition size, evict the
-// oldest chunk before accepting a new write. 20 % = ~1 MiB on a 4.94 MiB
-// partition, comfortably above the LittleFS metadata overhead floor.
+// Defense-in-depth: free-space watermark. When free drops below this fraction
+// of partition size, evict the oldest chunk before accepting a new write.
+// 20 % = ~1 MiB on a 4.94 MiB partition, above LittleFS metadata overhead.
 static constexpr uint8_t CHUNK_CAP_FREE_PCT = 20;
 
 // Hard upper bound for a single chunk payload. Sized for ~4 s of Opus at
