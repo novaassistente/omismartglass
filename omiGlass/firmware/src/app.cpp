@@ -13,7 +13,9 @@
 #include "opus_encoder.h"
 #include "ota.h"
 #include "pai_nvs.h"
+#include "pai_rec.h"
 #include "pai_storage.h"
+#include "pai_upload.h"
 #include "pai_wifi.h"
 
 // Battery state
@@ -359,6 +361,12 @@ void onOpusEncoded(uint8_t *data, size_t len)
     }
 
     audio_tx_write_pos = next_write;
+
+    // Second sink: feed pai_rec for chunk accumulation + persistent storage
+    // (S2.5/S3 pipeline — BLE flow above is non-regressed). pai_rec's mutex
+    // is recursive and the critical section is microseconds — does not
+    // measurably impact opus callback latency.
+    pai_rec::feed_opus_frame(data, len);
 }
 
 void broadcastAudioPacket(uint8_t *data, size_t len)
@@ -888,8 +896,21 @@ void setup_app()
         Serial.printf("[STORAGE] mount failed err=0x%x\n", storage_err);
     }
 
+    // REC accumulator — feeds pai_storage as Opus frames arrive on the BLE
+    // callback path (D1 REC half + D5 rotation). Must initialize after
+    // pai_storage::begin() so the underlying chunk_write target is mounted.
+    pai_rec::init();
+    Serial.println("[REC] pai_rec init OK");
+
     pai_wifi::begin();
     Serial.println("[WIFI] STA mode enabled (PAI_UPLOAD_MODE=1)");
+
+    // UPLOAD task — pinned to core 0 (D1 UPLOAD half), 15min cadence (D2),
+    // adaptive boost on WiFi-idle (D3). Task internally polls wifi state via
+    // pai_wifi::is_connected() so it's safe to start before STA assoc; the
+    // on-boot hmac_smoke() self-test does not need wifi.
+    pai_upload::start_task();
+    Serial.println("[UPLOAD] pai_upload task started (core 0)");
 #endif
 }
 
@@ -911,6 +932,10 @@ void loop_app()
         mic_process();
         opus_process();
     }
+
+    // REC ticker — drives time-based chunk rotation (CHUNK_ROTATE_INTERVAL_MS)
+    // independent of frame arrival rate. Wraps safely past millis() wrap at 49d.
+    pai_rec::tick_ms((uint32_t) now);
 
     // Send audio packets over BLE - PRIORITY over photo
     if (connected && audioSubscribed) {
