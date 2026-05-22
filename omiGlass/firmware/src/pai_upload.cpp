@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstring>
 
+#include "pai_certs.h"
 #include "pai_nvs.h"
 #include "pai_storage.h"
 #include "pai_wifi.h"
@@ -290,22 +291,15 @@ static PostResult post_chunk_once(uint64_t chunk_id, const uint8_t *body, size_t
     char sig_hex[65] = {0};
     hex_upper(sig, 32, sig_hex);
 
-    // HTTPS client. WiFiClientSecure.setInsecure() is intentional for
-    // S3a — chunk content is already encrypted-at-rest (Opus over
-    // HMAC-authenticated body) and the threat model puts the secrecy
-    // at the application layer, not TLS. CF root CA bundle pinning is
-    // a follow-up (TODO below).
-    //
-    // TODO(S3-followup): replace setInsecure() with pinned CF Origin
-    // CA bundle. Source: https://developers.cloudflare.com/ssl/static/
-    // origin_ca_rsa_root.pem . Add as PROGMEM blob + setCACert().
+    // HTTPS client. Pinned to the GTS Root R4 cross-signed root that
+    // currently anchors *.futuretools.today via Cloudflare edge (see
+    // pai_certs.h for rotation policy + verification commands). Defense-
+    // in-depth: HMAC over body remains the actual auth at the application
+    // layer; TLS pinning closes the MITM gap that setInsecure() left open.
     // WiFiClientSecure socket-level timeout: arduino-esp32's Stream::setTimeout
-    // unit is MILLISECONDS (matches HTTPClient::setTimeout). Earlier draft of
-    // this code passed HTTP_TIMEOUT_MS/1000=15 which on ms-unit builds would
-    // have set a 15 MILLISECOND read timeout — every TLS handshake would
-    // RETRYABLE-fail on any cellular hotspot. Pass milliseconds explicitly.
+    // unit is MILLISECONDS (matches HTTPClient::setTimeout).
     WiFiClientSecure client;
-    client.setInsecure();
+    client.setCACert(pai_certs::ROOT_CA_PEM);
     client.setTimeout(HTTP_TIMEOUT_MS);
 
     HTTPClient http;
