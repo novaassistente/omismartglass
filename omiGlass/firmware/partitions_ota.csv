@@ -8,8 +8,14 @@
 # The 'spiffs' subtype on the littlefs row is intentional — arduino-esp32's
 # LittleFS library reads partition entries whose subtype == data/spiffs and
 # the physical filesystem format is selected by the mount call, not the CSV.
+#
+# S3-resize 2026-05-22: app slots bumped 1.5MiB → 1.75MiB to fit firmware
+# after pai_upload (HMAC+HTTPS+WiFiClientSecure+pai_certs+cert PEM ~1.2KiB)
+# landed (~1.68MiB total). LittleFS shrunk 4.94MiB → 4.42MiB to compensate;
+# still well above pai_storage::CHUNK_CAP_BYTES (4 MiB) with ~448 KiB
+# headroom for LittleFS metadata overhead.
 nvs,      data, nvs,     0x9000,   0x5000,
 otadata,  data, ota,     0xe000,   0x2000,
-app0,     app,  ota_0,   0x10000,  0x180000,
-app1,     app,  ota_1,   0x190000, 0x180000,
-littlefs, data, spiffs,  0x310000, 0x4F0000,
+app0,     app,  ota_0,   0x10000,  0x1C0000,
+app1,     app,  ota_1,   0x1D0000, 0x1C0000,
+littlefs, data, spiffs,  0x390000, 0x470000,

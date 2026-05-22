@@ -17,6 +17,7 @@
 #include <freertos/task.h>
 #include <freertos/timers.h>
 #include <mbedtls/md.h>
+#include <nvs.h> // ESP_ERR_NVS_NOT_FOUND
 
 #include <atomic>
 #include <cstring>

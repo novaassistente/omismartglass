@@ -58,10 +58,13 @@ namespace pai_storage
 // =============================================================================
 // Architecture decisions D4/D5 alignment (project_pendant_architecture_decisions_locked_2026-05-21)
 // =============================================================================
-// D4 specified "6MB cap DROP OLDEST". Actual partition is 4.94 MiB so the
-// honest byte cap below is 4 MiB — leaves ~960 KiB for LittleFS metadata and
-// safety margin. This is the PRIMARY eviction gate per D4. The count and
-// percent caps below remain as defense-in-depth.
+// D4 specified "6MB cap DROP OLDEST". Actual partition is 4.42 MiB
+// (4 653 056 bytes; was 4.94 MiB pre-S3 before app slots grew to 1.75 MiB
+// each to fit pai_upload + HMAC + WiFiClientSecure + pai_certs — see
+// partitions_ota.csv §S3-resize note). Honest byte cap below is 4 MiB —
+// leaves ~448 KiB for LittleFS metadata and safety margin. PRIMARY
+// eviction gate per D4. The count and percent caps below remain as
+// defense-in-depth.
 //
 // D5 specified "chunk rotation 60 s OR 240 KiB". The 240 KiB target was the
 // CONCEPT-level rotation cadence (~60 s of Opus at 24 kbps). In practice the
