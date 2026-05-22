@@ -90,6 +90,13 @@ void notify_boost_eligible();
 // Wired by main-agent: pai_rec::feed_opus_frame ⇒ this call.
 void touch_last_mic_active(uint32_t now_ms);
 
+// True while the upload task is inside a drain cycle (between dequeue and
+// HTTP completion). Lock-free read of an atomic flag; safe from any core.
+// Used by power-management code (light-sleep gate) to avoid interrupting
+// a mid-POST TCP/TLS handshake — esp_light_sleep_start would drop the
+// connection and force a fresh re-handshake on wake.
+bool is_busy();
+
 } // namespace pai_upload
 
 #endif // PAI_UPLOAD_H

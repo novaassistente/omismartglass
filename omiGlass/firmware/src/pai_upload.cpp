@@ -94,6 +94,7 @@ static std::atomic<uint32_t> s_auth_fail_lifetime{0};
 static std::atomic<uint32_t> s_chunks_poisoned_lifetime{0};
 static std::atomic<bool> s_task_started{false};
 static std::atomic<bool> s_boost_eligible_hint{false};
+static std::atomic<bool> s_in_drain{false};
 
 // =============================================================================
 // Task-local state (touched only on core 0)
@@ -415,6 +416,15 @@ static ChunkOutcome upload_one_chunk(uint64_t chunk_id, const uint8_t *body, siz
 // cycle (so a chatty mic can't starve the drain).
 static void drain_available_chunks()
 {
+    // is_busy flag — power-management code reads this to skip light-sleep
+    // while we hold a TCP/TLS connection. Cleared via RAII at scope exit.
+    s_in_drain.store(true, std::memory_order_release);
+    struct DrainGuard {
+        ~DrainGuard()
+        {
+            s_in_drain.store(false, std::memory_order_release);
+        }
+    } drain_guard;
     const size_t initial_pending = pai_storage::chunks_pending_count();
     size_t drained = 0;
     for (size_t i = 0; i < initial_pending; ++i) {
@@ -605,6 +615,11 @@ void notify_boost_eligible()
 {
     // Hint only — the 1 Hz boost_tick_cb is the actual decision point.
     s_boost_eligible_hint.store(true, std::memory_order_relaxed);
+}
+
+bool is_busy()
+{
+    return s_in_drain.load(std::memory_order_acquire);
 }
 
 void touch_last_mic_active(uint32_t now_ms)

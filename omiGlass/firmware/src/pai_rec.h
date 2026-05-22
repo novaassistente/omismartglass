@@ -11,8 +11,10 @@
 // Architecture decisions respected (project_pendant_architecture_decisions_locked_2026-05-21):
 //   * D1 REC half: this module runs on the existing Arduino loopTask
 //     (core 1, high prio by default). NO new FreeRTOS task is spawned.
-//   * D5: rotate at CHUNK_ROTATE_BYTES (240 KiB) OR CHUNK_ROTATE_INTERVAL_MS
-//     (60 s), whichever first.
+//   * D5: rotate at CHUNK_ROTATE_BYTES OR CHUNK_ROTATE_INTERVAL_MS (60 s),
+//     whichever first. CHUNK_ROTATE_BYTES was reconciled from D5's
+//     concept-level 240 KiB to 16 KiB (= CHUNK_MAX_BYTES) in commit
+//     30b7edc88 so per-rotation chunk_write always fits the storage cap.
 //   * D6: pai_storage already filters .tmp out of chunk_read_next, so the
 //     "chunk being appended is never seen by uploader" invariant is held
 //     structurally — this module just feeds chunk_write with closed buffers.

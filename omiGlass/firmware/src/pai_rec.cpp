@@ -7,10 +7,12 @@
 //     buffer contents, or any byte-derived fingerprint of speech.
 //
 // Memory layout (ISC-2):
-//   * Two static 240 KiB buffers (buf_a, buf_b), allocated in .bss. Total
-//     static cost = 2 * CHUNK_ROTATE_BYTES = 480 KiB. The ESP32-S3 has 512
-//     KiB SRAM + 8 MiB PSRAM; PSRAM placement is left to the linker / build
-//     config. Either way, NO heap allocation in the hot path (D-PT4).
+//   * Two static 16 KiB buffers (buf_a, buf_b), allocated in .bss. Total
+//     static cost = 2 * CHUNK_ROTATE_BYTES = 32 KiB. CHUNK_ROTATE_BYTES was
+//     reconciled from D5's concept-level 240 KiB down to CHUNK_MAX_BYTES
+//     (16 KiB) in commit 30b7edc88 so per-rotation chunk_write always fits
+//     pai_storage's hard upper bound; see pai_storage.h §D4/D5 alignment.
+//     NO heap allocation in the hot path (D-PT4).
 //
 // Mutex granularity (D-PT4):
 //   * Recursive mutex covers only:
@@ -18,10 +20,19 @@
 //       (b) the read-modify-write of bytes_accumulated/active_started_ms
 //         inside feed_opus_frame and rotate().
 //   * pai_storage::chunk_write is called OUTSIDE the mutex on a captured
-//     snapshot pointer + length. This keeps the swap critical section in
-//     the microsecond range while chunk_write (which can BLOCK on LittleFS
-//     for milliseconds) runs without holding the mutex — feed_opus_frame
-//     on the NEW active buffer continues with zero stall.
+//     snapshot pointer + length. The pointer swap itself stays in the
+//     microsecond range.
+//   * Caveat post-D5-reconcile: with 16 KiB buffers, the byte-trigger
+//     rotation now fires roughly every ~4 s of continuous speech (vs once
+//     per ~60 s under the original 240 KiB intent). That means chunk_write
+//     — which can BLOCK on LittleFS metadata commits for milliseconds —
+//     runs on the Opus encoder callback thread up to ~15× more often than
+//     before. Today the BLE TX ring buffer absorbs the resulting jitter
+//     and the upstream I2S DMA has its own buffering, but if the encoder
+//     thread ever becomes latency-sensitive, this code should move
+//     chunk_write to a dedicated worker task fed by a FreeRTOS queue.
+//     Tracking via s_rotations_failed_lifetime — a spike in that counter
+//     under normal speech load indicates the queue refactor is overdue.
 //   * Recursive flavor (xSemaphoreCreateRecursiveMutex) is defensive: it
 //     allows feed_opus_frame to be re-entered indirectly (e.g. via tick_ms
 //     fast-rotate path) without self-deadlock.
@@ -198,16 +209,13 @@ void flush_snapshot(const RotationSnapshot &snap)
         return;
     }
 
-    // NOTE: snap.len may exceed pai_storage::CHUNK_MAX_BYTES (16 KiB) when the
-    // accumulator hits 240 KiB. pai_storage::chunk_write rejects with
-    // ESP_ERR_INVALID_ARG in that case. The D5 240 KiB rotation threshold and
-    // pai_storage's per-chunk 16 KiB cap are RECONCILED here by accepting that
-    // S2.5 slice ships with a known divergence: this slice routes the FULL
-    // 240 KiB accumulator into ONE chunk_write call. If pai_storage rejects on
-    // size, the rotation is counted as failed and the buffer is retained for
-    // retry — matching the D-PT4 / ISC-5 contract. Reconciling the storage cap
-    // upward (or splitting in this module) is a follow-up slice owned by the
-    // main agent; the PRD D4/D5 alignment note flags this explicitly.
+    // snap.len is bounded by BUF_SIZE = pai_storage::CHUNK_ROTATE_BYTES which
+    // post-30b7edc88 reconcile is 16 KiB = CHUNK_MAX_BYTES, so chunk_write's
+    // `len > CHUNK_MAX_BYTES` check is structurally unreachable by this path.
+    // The s_rotations_failed_lifetime counter now exclusively reflects
+    // ESP_ERR_NO_MEM (full filesystem after eviction) — a spike in it under
+    // normal operation indicates the partition is full of poisoned files
+    // (see pai_storage::chunks_poisoned_count) or D4 eviction is mis-tuned.
     uint64_t chunk_id = 0;
     esp_err_t err = pai_storage::chunk_write(snap.buf, snap.len, &chunk_id);
     if (err == ESP_OK) {
@@ -225,7 +233,7 @@ void flush_snapshot(const RotationSnapshot &snap)
                  (unsigned) s_rotations_failed_lifetime.load(std::memory_order_relaxed));
         // Per ISC-5: on failure we DO NOT lose audio mid-rotation. The next
         // rotation tick overwrites the shadow, so the worst case is one
-        // 240 KiB window lost — and only when the filesystem is genuinely
+        // ~4 s window lost — and only when the filesystem is genuinely
         // exhausted after eviction. The currently-active buffer (which was
         // swapped in by do_swap_locked) keeps accepting frames either way.
     }

@@ -334,6 +334,15 @@ void onMicData(int16_t *data, size_t samples)
 
 void onOpusEncoded(uint8_t *data, size_t len)
 {
+    // D1 invariant: REC NEVER pauses. The persistent-storage sink (pai_rec)
+    // MUST be fed BEFORE the BLE TX ring buffer because the BLE path has
+    // two early-return paths (oversize frame, ring buffer full when phone
+    // is disconnected) that would silently kill the persistent recording
+    // exactly when the offline buffer matters most.
+#if PAI_UPLOAD_MODE
+    pai_rec::feed_opus_frame(data, len);
+#endif
+
     // Store encoded data in TX ring buffer
     if (len > OPUS_OUTPUT_MAX_BYTES) {
         return;
@@ -361,12 +370,6 @@ void onOpusEncoded(uint8_t *data, size_t len)
     }
 
     audio_tx_write_pos = next_write;
-
-    // Second sink: feed pai_rec for chunk accumulation + persistent storage
-    // (S2.5/S3 pipeline — BLE flow above is non-regressed). pai_rec's mutex
-    // is recursive and the critical section is microseconds — does not
-    // measurably impact opus callback latency.
-    pai_rec::feed_opus_frame(data, len);
 }
 
 void broadcastAudioPacket(uint8_t *data, size_t len)
@@ -935,7 +938,10 @@ void loop_app()
 
     // REC ticker — drives time-based chunk rotation (CHUNK_ROTATE_INTERVAL_MS)
     // independent of frame arrival rate. Wraps safely past millis() wrap at 49d.
+    // Gated on PAI_UPLOAD_MODE to keep BLE-only builds at zero overhead.
+#if PAI_UPLOAD_MODE
     pai_rec::tick_ms((uint32_t) now);
+#endif
 
     // Send audio packets over BLE - PRIORITY over photo
     if (connected && audioSubscribed) {
@@ -1045,9 +1051,22 @@ void loop_app()
         photo_chunks_this_loop = 0; // Reset when not uploading
     }
 
-    // Light sleep optimization - major power savings while maintaining BLE
-    // Disable light sleep when audio is active
-    if (!photoDataUploading && !audioSubscribed) {
+    // Light sleep optimization - major power savings while maintaining BLE.
+    // Gated on:
+    //   * audio not actively streaming over BLE (existing)
+    //   * camera not uploading (existing)
+    //   * upload task not mid-POST (pai_upload::is_busy) — esp_light_sleep
+    //     would drop the TCP/TLS connection and force a fresh handshake
+    //     on wake; worse, partial body may have been counted by server.
+    //   * REC accumulator empty (pai_rec::bytes_pending == 0) — entering
+    //     sleep with bytes pending freezes tick_ms past the rotation
+    //     deadline, so audio held in the active buffer stays unflushed
+    //     across the sleep window.
+    bool s3_idle = true;
+#if PAI_UPLOAD_MODE
+    s3_idle = !pai_upload::is_busy() && pai_rec::bytes_pending() == 0;
+#endif
+    if (!photoDataUploading && !audioSubscribed && s3_idle) {
         enableLightSleep();
     }
 

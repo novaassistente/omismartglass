@@ -111,7 +111,26 @@ echo
 # Gate 4: 401 path — tampered HMAC must be rejected.
 # -----------------------------------------------------------------------------
 echo "[gate-4] POST /upload with tampered HMAC..."
-TAMPERED_SIG="${SIG:0:62}AA"  # last 2 chars replaced
+# Deterministic tamper: flip the last hex nibble. Avoids the ~1/256
+# false-negative that "${SIG:0:62}AA" produced when SIG already ended in AA
+# (tampered == original → server returned 200, gate misclassified).
+LAST_CHAR="${SIG: -1}"
+case "$LAST_CHAR" in
+    0) TAMPER_CHAR=1 ;; 1) TAMPER_CHAR=0 ;;
+    2) TAMPER_CHAR=3 ;; 3) TAMPER_CHAR=2 ;;
+    4) TAMPER_CHAR=5 ;; 5) TAMPER_CHAR=4 ;;
+    6) TAMPER_CHAR=7 ;; 7) TAMPER_CHAR=6 ;;
+    8) TAMPER_CHAR=9 ;; 9) TAMPER_CHAR=8 ;;
+    A) TAMPER_CHAR=B ;; B) TAMPER_CHAR=A ;;
+    C) TAMPER_CHAR=D ;; D) TAMPER_CHAR=C ;;
+    E) TAMPER_CHAR=F ;; F) TAMPER_CHAR=E ;;
+    *) TAMPER_CHAR=0 ;;  # shouldn't happen with uppercase hex output
+esac
+TAMPERED_SIG="${SIG:0:63}${TAMPER_CHAR}"
+if [[ "$TAMPERED_SIG" == "$SIG" ]]; then
+    echo "  FAIL: tamper produced identical sig (case logic bug)"
+    exit 4
+fi
 HTTP=$(curl -s -o /tmp/smoke_resp_4.json -w "%{http_code}" \
     -X POST "$ENDPOINT" \
     -H "User-Agent: $SMOKE_UA" \
