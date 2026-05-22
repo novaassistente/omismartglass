@@ -49,14 +49,22 @@ static constexpr uint32_t DRAIN_MIN_GAP_MS = 60u * 1000u; // ISC-30
 
 // HTTPS / retry policy.
 static constexpr const char *DEFAULT_ENDPOINT = "https://pendant.futuretools.today/upload";
-static constexpr const char *USER_AGENT = "PAI-Pendant/1.0"; // ISC-20 + CF Bot Fight workaround
+// User-Agent aligned to hmac-contract.md §Wire-format — the E2E-verified value
+// known to bypass Cloudflare Bot Fight Mode against pendant.futuretools.today.
+// "PAI-Pendant/*" is NOT yet on any documented allowlist; using the contract
+// value avoids regression if CF tightens to a UA allowlist.
+static constexpr const char *USER_AGENT = "pendant-nova/0.1";
 static constexpr uint32_t HTTP_TIMEOUT_MS = 15u * 1000u;
 static constexpr uint8_t MAX_RETRY_PER_CHUNK = 3;
 static constexpr uint32_t BACKOFF_BASE_MS = 1000u;
 static constexpr uint32_t BACKOFF_CAP_MS = 60u * 1000u;
 
-// Task config.
-static constexpr uint32_t TASK_STACK_BYTES = 8192;
+// Task config — 16 KiB stack to give mbedtls TLS handshake + WiFiClientSecure
+// + HTTPClient headroom. 8 KiB was tight: mbedtls handshake alone runs ~6 KiB
+// (cipher state machine + record buffers); adding HTTPClient header build +
+// our local sig_hex[65] + chunk_id_str[32] frames left ~0-2 KiB margin in the
+// worst case. Stack overflow on first POST after long idle was plausible.
+static constexpr uint32_t TASK_STACK_BYTES = 16u * 1024u;
 static constexpr UBaseType_t TASK_PRIO = 5;
 static constexpr BaseType_t TASK_CORE = 0; // core 1 reserved for REC
 
@@ -195,10 +203,16 @@ static bool build_chunk_path(uint64_t chunk_id, const char *ext, char *out, size
 }
 
 // True if `chunk_id` has hit 401 at least once already in this boot.
+// chunk_id == 0 (pre-NTP boot edge case) tracked via dedicated flag because
+// the ring buffer uses 0 as the empty sentinel and would never match it.
+static bool s_auth_fail_zero_seen = false;
 static bool auth_fail_seen(uint64_t chunk_id)
 {
+    if (chunk_id == 0) {
+        return s_auth_fail_zero_seen;
+    }
     for (size_t i = 0; i < AUTH_FAIL_RING_LEN; ++i) {
-        if (s_auth_fail_ring[i] == chunk_id && chunk_id != 0) {
+        if (s_auth_fail_ring[i] == chunk_id) {
             return true;
         }
     }
@@ -208,6 +222,10 @@ static bool auth_fail_seen(uint64_t chunk_id)
 // Record a 401 against `chunk_id` for poison-on-second-fail detection.
 static void auth_fail_record(uint64_t chunk_id)
 {
+    if (chunk_id == 0) {
+        s_auth_fail_zero_seen = true;
+        return;
+    }
     s_auth_fail_ring[s_auth_fail_ring_idx] = chunk_id;
     s_auth_fail_ring_idx = (s_auth_fail_ring_idx + 1) % AUTH_FAIL_RING_LEN;
 }
@@ -295,35 +313,47 @@ static PostResult post_chunk_once(uint64_t chunk_id, const uint8_t *body, size_t
     // TODO(S3-followup): replace setInsecure() with pinned CF Origin
     // CA bundle. Source: https://developers.cloudflare.com/ssl/static/
     // origin_ca_rsa_root.pem . Add as PROGMEM blob + setCACert().
+    // WiFiClientSecure socket-level timeout: arduino-esp32's Stream::setTimeout
+    // unit is MILLISECONDS (matches HTTPClient::setTimeout). Earlier draft of
+    // this code passed HTTP_TIMEOUT_MS/1000=15 which on ms-unit builds would
+    // have set a 15 MILLISECOND read timeout — every TLS handshake would
+    // RETRYABLE-fail on any cellular hotspot. Pass milliseconds explicitly.
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(HTTP_TIMEOUT_MS / 1000);
+    client.setTimeout(HTTP_TIMEOUT_MS);
 
     HTTPClient http;
     http.setConnectTimeout(HTTP_TIMEOUT_MS);
     http.setTimeout(HTTP_TIMEOUT_MS);
     http.setReuse(false);
+    // Set UA via the dedicated setter BEFORE begin(): addHeader("User-Agent",..)
+    // after begin() is silently overridden by HTTPClient's internal _userAgent
+    // on some arduino-esp32 versions, which would let the default UA hit
+    // Cloudflare and trigger Bot Fight Mode 403/1010.
+    http.setUserAgent(USER_AGENT);
 
     const char *endpoint = (s_endpoint[0] != '\0') ? s_endpoint : DEFAULT_ENDPOINT;
     if (!http.begin(client, endpoint)) {
         return PostResult::RETRYABLE;
     }
 
-    // Required headers (hmac-contract.md §Wire format).
+    // Required headers (hmac-contract.md §Wire format). User-Agent set via
+    // setUserAgent() above; Content-Type/Content-Length handled internally by
+    // HTTPClient::POST(uint8_t*, size_t).
     char chunk_id_str[32] = {0};
     snprintf(chunk_id_str, sizeof(chunk_id_str), "%llu", (unsigned long long) chunk_id);
     http.addHeader("Content-Type", "application/octet-stream");
     http.addHeader("X-Chunk-Id", chunk_id_str);
     http.addHeader("X-HMAC-SHA256", sig_hex);
-    http.addHeader("User-Agent", USER_AGENT);
 
     int code = http.POST(const_cast<uint8_t *>(body), body_len);
     http.end();
 
-    // sig_hex sits on the stack; zero it before return so a stack-dump
-    // tool can't recover it from frame residue. Body is the caller's
-    // — they're responsible for their own buffer lifetime.
+    // Defense-in-depth: zero BOTH the hex and raw sig buffers on the stack
+    // before return so a stack-dump tool can't recover the secret from frame
+    // residue. Body is the caller's — they own their buffer lifetime.
     memset(sig_hex, 0, sizeof(sig_hex));
+    memset(sig, 0, sizeof(sig));
 
     if (code == 200) {
         return PostResult::OK;
@@ -340,28 +370,35 @@ static PostResult post_chunk_once(uint64_t chunk_id, const uint8_t *body, size_t
     return PostResult::PERMANENT_FAIL;
 }
 
+// Tri-state outcome of upload_one_chunk so the drain loop can distinguish
+// individual-chunk failure (poison — keep draining) from transport-wide
+// failure (retryable-exhausted — stop the drain so we don't hammer a flapping
+// server with the next chunk).
+enum class ChunkOutcome : uint8_t {
+    UPLOADED,            // 200 — caller deletes
+    POISONED,            // 401 repeat OR 4xx PERMANENT_FAIL — chunk renamed .poisoned
+    RETRYABLE_EXHAUSTED, // 3× 5xx/network — chunk left in place for next cycle
+};
+
 // Upload one chunk with full retry / backoff / poison policy applied.
-// Returns true iff the chunk was successfully accepted (200) and should
-// be deleted from storage. Returns false iff the chunk should be left
-// in place (transient failure) OR poisoned (handled internally).
-static bool upload_one_chunk(uint64_t chunk_id, const uint8_t *body, size_t body_len)
+static ChunkOutcome upload_one_chunk(uint64_t chunk_id, const uint8_t *body, size_t body_len)
 {
     uint32_t backoff_ms = BACKOFF_BASE_MS;
     for (uint8_t attempt = 0; attempt < MAX_RETRY_PER_CHUNK; ++attempt) {
         PostResult r = post_chunk_once(chunk_id, body, body_len);
         if (r == PostResult::OK) {
-            return true;
+            return ChunkOutcome::UPLOADED;
         }
         if (r == PostResult::HMAC_MISMATCH) {
             s_auth_fail_lifetime.fetch_add(1, std::memory_order_relaxed);
             if (auth_fail_seen(chunk_id)) {
                 // Second 401 for the same chunk in this boot — contract
                 // is drifting OR the chunk body is corrupt. Poison and
-                // move on so the rest of the drain proceeds.
+                // continue with the rest of the drain.
                 Serial.printf("[UPLOAD] hmac_mismatch_repeat chunk_id=%llu — poisoning\n",
                               (unsigned long long) chunk_id);
                 poison_chunk(chunk_id);
-                return false;
+                return ChunkOutcome::POISONED;
             }
             // First 401: record, warn, retry once more (next attempt of
             // the loop). NEVER log sig or key bytes.
@@ -376,7 +413,7 @@ static bool upload_one_chunk(uint64_t chunk_id, const uint8_t *body, size_t body
         if (r == PostResult::PERMANENT_FAIL) {
             // 400 / 403 etc — chunk will never succeed. Poison.
             poison_chunk(chunk_id);
-            return false;
+            return ChunkOutcome::POISONED;
         }
         // RETRYABLE: 5xx or network glitch. Exponential backoff.
         Serial.printf("[UPLOAD] retryable chunk_id=%llu attempt=%u backoff=%ums\n",
@@ -389,8 +426,9 @@ static bool upload_one_chunk(uint64_t chunk_id, const uint8_t *body, size_t body
     // Exhausted retries — leave chunk in place; next drain cycle will
     // try again (with a fresh retry budget). DO NOT poison here:
     // exhausting retries on 5xx/network is a server-side or transport
-    // condition that should self-resolve.
-    return false;
+    // condition that should self-resolve. Caller stops the drain because
+    // continuing would just hammer the same flapping server.
+    return ChunkOutcome::RETRYABLE_EXHAUSTED;
 }
 
 // Drain all available .opus chunks. Bounded by chunks_pending_count()
@@ -412,14 +450,20 @@ static void drain_available_chunks()
             break;
         }
 
-        if (upload_one_chunk(chunk_id, s_chunk_buf, out_len)) {
+        ChunkOutcome oc = upload_one_chunk(chunk_id, s_chunk_buf, out_len);
+        if (oc == ChunkOutcome::UPLOADED) {
             pai_storage::chunk_delete(chunk_id);
             s_uploaded_lifetime.fetch_add(1, std::memory_order_relaxed);
             ++drained;
+        } else if (oc == ChunkOutcome::POISONED) {
+            // Individual chunk is unrecoverable; the rest of the drain may
+            // still succeed. Continue (NOT break) so a single corrupt or
+            // contract-drifted chunk doesn't cap throughput at one chunk
+            // per 15min cycle.
+            continue;
         } else {
-            // Chunk left in place (RETRYABLE exhausted) OR poisoned.
-            // Either way, stop the drain so we don't hammer the server
-            // on the next chunk if WiFi/server is having a bad minute.
+            // RETRYABLE_EXHAUSTED: transport/server-side flap. Stop the
+            // drain to avoid hammering — let backoff+next cycle recover.
             break;
         }
 
