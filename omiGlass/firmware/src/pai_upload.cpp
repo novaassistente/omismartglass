@@ -11,7 +11,6 @@
 
 #include <Arduino.h>
 #include <HTTPClient.h>
-#include <LittleFS.h>
 #include <WiFiClientSecure.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -190,18 +189,6 @@ static bool token_is_all_zeros(const uint8_t *tok, size_t len)
     return true;
 }
 
-// Build chunk filename "0000123456789_0000.opus" (and .poisoned variant)
-// from a chunk_id, mirroring pai_storage's encode_id() schema:
-//   id = (ts_ms << 14) | (seq & 0x3FFF)
-// out must be at least 32 bytes. Returns false on overflow.
-static bool build_chunk_path(uint64_t chunk_id, const char *ext, char *out, size_t out_max)
-{
-    const uint64_t ts_ms = chunk_id >> 14;
-    const uint16_t seq = static_cast<uint16_t>(chunk_id & 0x3FFF);
-    int n = snprintf(out, out_max, "/chunks/%013llu_%04u%s", (unsigned long long) ts_ms, (unsigned) seq, ext);
-    return n > 0 && static_cast<size_t>(n) < out_max;
-}
-
 // True if `chunk_id` has hit 401 at least once already in this boot.
 // chunk_id == 0 (pre-NTP boot edge case) tracked via dedicated flag because
 // the ring buffer uses 0 as the empty sentinel and would never match it.
@@ -230,33 +217,25 @@ static void auth_fail_record(uint64_t chunk_id)
     s_auth_fail_ring_idx = (s_auth_fail_ring_idx + 1) % AUTH_FAIL_RING_LEN;
 }
 
-// Rename chunk's .opus → .poisoned via direct LittleFS call. We avoid
-// extending pai_storage's API surface for this one-off (the file is now
-// excluded from chunk_read_next naturally since parse_filename rejects
-// any extension other than .opus / .tmp). Returns true on success.
+// Poison a chunk via the pai_storage API so the pending-count is decremented
+// atomically AND chunks_poisoned_count is incremented (boot-scan + eviction
+// fallback both see the .poisoned file consistently). Falls back to
+// chunk_delete on rename failure so a bad chunk never tight-loops.
 static bool poison_chunk(uint64_t chunk_id)
 {
-    char opus_path[64] = {0};
-    char poisoned_path[64] = {0};
-    if (!build_chunk_path(chunk_id, ".opus", opus_path, sizeof(opus_path))) {
-        return false;
-    }
-    if (!build_chunk_path(chunk_id, ".poisoned", poisoned_path, sizeof(poisoned_path))) {
-        return false;
-    }
-    bool ok = LittleFS.rename(opus_path, poisoned_path);
-    if (ok) {
+    esp_err_t e = pai_storage::poison_chunk(chunk_id);
+    if (e == ESP_OK) {
         s_chunks_poisoned_lifetime.fetch_add(1, std::memory_order_relaxed);
         Serial.printf("[UPLOAD] poisoned chunk_id=%llu\n", (unsigned long long) chunk_id);
-    } else {
-        // Last-resort: delete via pai_storage so the bad chunk doesn't
-        // re-loop forever. Counter still goes up so the operator sees
-        // the symptom in observability.
-        Serial.printf("[UPLOAD] poison_rename_failed chunk_id=%llu — deleting\n", (unsigned long long) chunk_id);
-        pai_storage::chunk_delete(chunk_id);
-        s_chunks_poisoned_lifetime.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
-    return ok;
+    // Last-resort: delete so the bad chunk doesn't re-loop forever. Counter
+    // still goes up so the operator sees the symptom in observability.
+    Serial.printf(
+        "[UPLOAD] poison_rename_failed chunk_id=%llu err=%d — deleting\n", (unsigned long long) chunk_id, (int) e);
+    pai_storage::chunk_delete(chunk_id);
+    s_chunks_poisoned_lifetime.fetch_add(1, std::memory_order_relaxed);
+    return false;
 }
 
 // Read NVS cadence; fall back to default and clamp to MIN_TICK_MS.

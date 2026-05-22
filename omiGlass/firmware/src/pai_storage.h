@@ -138,6 +138,28 @@ size_t chunks_pending_count();
 // Monotonically increasing; resets to 0 on reboot.
 size_t chunks_evicted_lifetime();
 
+// Rename chunk_id's .opus file to .poisoned. Used by pai_upload when a
+// chunk fails server-side validation (e.g., second 401 in a row) so it
+// is filtered out of subsequent chunk_read_next calls without being
+// fully deleted (preserves forensic trail). Atomically decrements
+// chunks_pending_count and increments chunks_poisoned_count.
+//
+// Returns:
+//   ESP_OK                — file renamed (or already poisoned)
+//   ESP_ERR_INVALID_STATE — begin() not yet called
+//   ESP_FAIL              — rename failed (file vanished mid-call etc.);
+//                           on rename failure caller should chunk_delete()
+//                           as a fallback so the chunk never re-uploads.
+esp_err_t poison_chunk(uint64_t chunk_id);
+
+// Number of .poisoned chunks currently on disk. Counted at boot via
+// scan + maintained by poison_chunk. Used for observability AND so a
+// future operator-facing tool can selectively wipe poison files. These
+// chunks count against bytes_over_cap (LittleFS.usedBytes includes them)
+// so the eviction loop falls back to evicting poisoned files when no
+// .opus chunks remain — preventing permanent space leak.
+size_t chunks_poisoned_count();
+
 } // namespace pai_storage
 
 #endif // PAI_STORAGE_H

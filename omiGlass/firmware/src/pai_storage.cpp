@@ -12,13 +12,14 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
-#include <atomic>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
+
+#include <atomic>
 
 namespace pai_storage
 {
@@ -34,6 +35,7 @@ constexpr const char *PARTITION_LABEL = "littlefs";
 constexpr const char *CHUNKS_DIR = "/littlefs/chunks";
 constexpr const char *CHUNK_EXT = ".opus";
 constexpr const char *TMP_EXT = ".tmp";
+constexpr const char *POISONED_EXT = ".poisoned";
 constexpr size_t MAX_OPEN_FILES = 5;
 
 // Filename schema: <unix_ms_zero_padded_13>_<seq_4digits>.opus
@@ -58,6 +60,7 @@ SemaphoreHandle_t s_mutex = nullptr;
 std::atomic<bool> s_mounted{false};
 std::atomic<size_t> s_pending_count{0};
 std::atomic<size_t> s_evicted_lifetime{0};
+std::atomic<size_t> s_poisoned_count{0};
 uint16_t s_boot_seq = 0; // monotonic per-boot sequence number, mutex-protected
 
 // -----------------------------------------------------------------------------
@@ -65,7 +68,7 @@ uint16_t s_boot_seq = 0; // monotonic per-boot sequence number, mutex-protected
 // -----------------------------------------------------------------------------
 class Lock
 {
-public:
+  public:
     explicit Lock(TickType_t wait = portMAX_DELAY) : ok_(false)
     {
         if (s_mutex != nullptr) {
@@ -78,12 +81,15 @@ public:
             xSemaphoreGive(s_mutex);
         }
     }
-    bool held() const { return ok_; }
+    bool held() const
+    {
+        return ok_;
+    }
 
     Lock(const Lock &) = delete;
     Lock &operator=(const Lock &) = delete;
 
-private:
+  private:
     bool ok_;
 };
 
@@ -128,18 +134,30 @@ bool build_full_path(const char *fname, char *out, size_t out_max)
     return n > 0 && (size_t) n < out_max;
 }
 
-// Parse "0000123456789_0000.opus" or ".tmp". Returns true on success.
-bool parse_filename(const char *name, uint64_t *ts_ms, uint16_t *seq, bool *is_tmp)
+// File kinds in /littlefs/chunks/. .opus = pending upload, .tmp = mid-write
+// (cleaned at boot), .poisoned = upload failed validation (skipped by
+// drain, eligible for eviction fallback when no .opus remain).
+enum class ChunkKind : uint8_t {
+    UNKNOWN = 0,
+    OPUS,
+    TMP,
+    POISONED,
+};
+
+// Parse "0000123456789_0000.<ext>" with ext in {opus, tmp, poisoned}.
+// Returns true on success and sets *out_kind. The legacy parse_filename
+// is_tmp signature is preserved as a wrapper below for existing callers.
+bool parse_filename_kind(const char *name, uint64_t *ts_ms, uint16_t *seq, ChunkKind *out_kind)
 {
-    if (name == nullptr) {
+    if (name == nullptr || out_kind == nullptr) {
         return false;
     }
-    // Expected lengths: 13 digits + "_" + 4 digits + ".opus" (5) or ".tmp" (4)
+    *out_kind = ChunkKind::UNKNOWN;
+    // Shortest valid form is 13 digits + "_" + 4 digits + ".tmp" = 22 chars.
     size_t len = strlen(name);
-    if (len < 13 + 1 + 4 + 4) { // shortest is ".tmp"
+    if (len < 13 + 1 + 4 + 4) {
         return false;
     }
-    // Validate digit prefix
     for (size_t i = 0; i < 13; ++i) {
         if (name[i] < '0' || name[i] > '9') {
             return false;
@@ -153,10 +171,13 @@ bool parse_filename(const char *name, uint64_t *ts_ms, uint16_t *seq, bool *is_t
             return false;
         }
     }
-    if (strcmp(name + 18, CHUNK_EXT) == 0) {
-        *is_tmp = false;
-    } else if (strcmp(name + 18, TMP_EXT) == 0) {
-        *is_tmp = true;
+    const char *ext = name + 18;
+    if (strcmp(ext, CHUNK_EXT) == 0) {
+        *out_kind = ChunkKind::OPUS;
+    } else if (strcmp(ext, TMP_EXT) == 0) {
+        *out_kind = ChunkKind::TMP;
+    } else if (strcmp(ext, POISONED_EXT) == 0) {
+        *out_kind = ChunkKind::POISONED;
     } else {
         return false;
     }
@@ -174,19 +195,43 @@ bool parse_filename(const char *name, uint64_t *ts_ms, uint16_t *seq, bool *is_t
     return true;
 }
 
+// Legacy 3-arg parser preserved for callers that only care about opus/tmp
+// distinction. Returns false on anything other than those two kinds (so
+// .poisoned does not enter the drain / find_oldest_opus paths).
+bool parse_filename(const char *name, uint64_t *ts_ms, uint16_t *seq, bool *is_tmp)
+{
+    ChunkKind k;
+    if (!parse_filename_kind(name, ts_ms, seq, &k)) {
+        return false;
+    }
+    if (k == ChunkKind::OPUS) {
+        *is_tmp = false;
+        return true;
+    }
+    if (k == ChunkKind::TMP) {
+        *is_tmp = true;
+        return true;
+    }
+    return false; // POISONED — invisible to legacy callers
+}
+
 // -----------------------------------------------------------------------------
 // Directory walks (caller must hold s_mutex)
 // -----------------------------------------------------------------------------
 
-// Count .opus entries, optionally scrub .tmp entries on the way. Updates
+// Count .opus + .poisoned entries, scrub .tmp orphans. Updates
 // caller-supplied counters. Returns false on directory-open failure.
-bool scan_chunks_dir(size_t *out_opus_count, size_t *out_tmp_scrubbed)
+// The poisoned count parameter is optional (callers pre-S3 pass nullptr).
+bool scan_chunks_dir(size_t *out_opus_count, size_t *out_tmp_scrubbed, size_t *out_poisoned_count)
 {
     if (out_opus_count != nullptr) {
         *out_opus_count = 0;
     }
     if (out_tmp_scrubbed != nullptr) {
         *out_tmp_scrubbed = 0;
+    }
+    if (out_poisoned_count != nullptr) {
+        *out_poisoned_count = 0;
     }
 
     File dir = LittleFS.open(CHUNKS_DIR);
@@ -204,27 +249,24 @@ bool scan_chunks_dir(size_t *out_opus_count, size_t *out_tmp_scrubbed)
 
     File entry = dir.openNextFile();
     while (entry) {
-        const char *full = entry.name(); // returns "/littlefs/chunks/xxx" or "xxx" depending on core ver
-        // arduino-esp32 LittleFS returns leaf name from openNextFile() on
-        // recent cores; handle both by finding the last '/'.
+        const char *full = entry.name();
         const char *leaf = strrchr(full, '/');
         leaf = (leaf != nullptr) ? (leaf + 1) : full;
 
         uint64_t ts_ms = 0;
         uint16_t seq = 0;
-        bool is_tmp = false;
-        bool ok = parse_filename(leaf, &ts_ms, &seq, &is_tmp);
-        if (ok) {
-            if (is_tmp) {
-                // Premortem S2-P3 recovery: queue orphan .tmp for post-walk scrub.
+        ChunkKind kind = ChunkKind::UNKNOWN;
+        if (parse_filename_kind(leaf, &ts_ms, &seq, &kind)) {
+            if (kind == ChunkKind::TMP) {
                 if (orphan_count < MAX_TMP_ORPHANS) {
                     if (build_full_path(leaf, orphan_paths[orphan_count], FULL_PATH_BUF_LEN)) {
                         ++orphan_count;
                     }
                 }
-                // else: bounded buffer — drop, will scrub on next boot
-            } else if (out_opus_count != nullptr) {
+            } else if (kind == ChunkKind::OPUS && out_opus_count != nullptr) {
                 ++(*out_opus_count);
+            } else if (kind == ChunkKind::POISONED && out_poisoned_count != nullptr) {
+                ++(*out_poisoned_count);
             }
         }
         entry.close();
@@ -291,14 +333,70 @@ bool find_oldest_opus(char *out_name, size_t out_max, uint64_t *out_id)
     return true;
 }
 
+// Find the OLDEST .poisoned chunk (lowest timestamp+seq). Used as the
+// eviction fallback when no .opus chunks remain but bytes_over_cap still
+// trips — prevents permanent space leaks from accumulated poison files.
+bool find_oldest_poisoned(char *out_name, size_t out_max, uint64_t *out_id)
+{
+    File dir = LittleFS.open(CHUNKS_DIR);
+    if (!dir || !dir.isDirectory()) {
+        return false;
+    }
+    bool found = false;
+    uint64_t best_ts = UINT64_MAX;
+    uint16_t best_seq = UINT16_MAX;
+    char best_leaf[FILENAME_BUF_LEN] = {0};
+
+    File entry = dir.openNextFile();
+    while (entry) {
+        const char *full = entry.name();
+        const char *leaf = strrchr(full, '/');
+        leaf = (leaf != nullptr) ? (leaf + 1) : full;
+        uint64_t ts_ms = 0;
+        uint16_t seq = 0;
+        ChunkKind kind = ChunkKind::UNKNOWN;
+        if (parse_filename_kind(leaf, &ts_ms, &seq, &kind) && kind == ChunkKind::POISONED) {
+            if (!found || ts_ms < best_ts || (ts_ms == best_ts && seq < best_seq)) {
+                found = true;
+                best_ts = ts_ms;
+                best_seq = seq;
+                strncpy(best_leaf, leaf, sizeof(best_leaf) - 1);
+                best_leaf[sizeof(best_leaf) - 1] = '\0';
+            }
+        }
+        entry.close();
+        entry = dir.openNextFile();
+    }
+    dir.close();
+    if (!found) {
+        return false;
+    }
+    if (out_name != nullptr) {
+        strncpy(out_name, best_leaf, out_max - 1);
+        out_name[out_max - 1] = '\0';
+    }
+    if (out_id != nullptr) {
+        *out_id = encode_id(best_ts, best_seq);
+    }
+    return true;
+}
+
 // Evict the oldest .opus chunk if present. Caller holds mutex. Returns true
-// if a chunk was actually evicted.
+// if a chunk was actually evicted. Falls back to oldest .poisoned when no
+// .opus remain — otherwise poison files become permanent space leaks that
+// count against bytes_over_cap but cannot be reclaimed.
 bool evict_oldest_unlocked()
 {
     char leaf[FILENAME_BUF_LEN] = {0};
     uint64_t id = 0;
+    bool evicted_poisoned = false;
     if (!find_oldest_opus(leaf, sizeof(leaf), &id)) {
-        return false;
+        // No .opus chunks — fall back to evicting oldest .poisoned so we
+        // don't run out of partition space due to accumulated poison.
+        if (!find_oldest_poisoned(leaf, sizeof(leaf), &id)) {
+            return false;
+        }
+        evicted_poisoned = true;
     }
     char path[FULL_PATH_BUF_LEN] = {0};
     if (!build_full_path(leaf, path, sizeof(path))) {
@@ -306,6 +404,13 @@ bool evict_oldest_unlocked()
     }
     if (!LittleFS.remove(path)) {
         return false;
+    }
+    if (evicted_poisoned) {
+        if (s_poisoned_count.load(std::memory_order_relaxed) > 0) {
+            s_poisoned_count.fetch_sub(1, std::memory_order_relaxed);
+        }
+        s_evicted_lifetime.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
     if (s_pending_count.load(std::memory_order_relaxed) > 0) {
         s_pending_count.fetch_sub(1, std::memory_order_relaxed);
@@ -402,17 +507,21 @@ esp_err_t begin()
         return ESP_FAIL;
     }
 
-    // Boot-time scan: count .opus and scrub orphan .tmp.
+    // Boot-time scan: count .opus + .poisoned and scrub orphan .tmp.
     size_t opus_count = 0;
     size_t tmp_scrubbed = 0;
-    if (!scan_chunks_dir(&opus_count, &tmp_scrubbed)) {
-        // Dir open failed despite mkdir success — treat as empty but log.
+    size_t poisoned_count = 0;
+    if (!scan_chunks_dir(&opus_count, &tmp_scrubbed, &poisoned_count)) {
         Serial.println("[STORAGE] dir scan failed at boot");
     }
     s_pending_count.store(opus_count, std::memory_order_relaxed);
+    s_poisoned_count.store(poisoned_count, std::memory_order_relaxed);
 
     if (tmp_scrubbed > 0) {
         Serial.printf("[STORAGE] scrubbed %u orphan .tmp files\n", (unsigned) tmp_scrubbed);
+    }
+    if (poisoned_count > 0) {
+        Serial.printf("[STORAGE] %u .poisoned files survived reboot (eviction fallback)\n", (unsigned) poisoned_count);
     }
 
     // Release fence — ensures any post-begin() loader sees the FS in its
@@ -608,6 +717,48 @@ size_t chunks_pending_count()
 size_t chunks_evicted_lifetime()
 {
     return s_evicted_lifetime.load(std::memory_order_relaxed);
+}
+
+size_t chunks_poisoned_count()
+{
+    return s_poisoned_count.load(std::memory_order_relaxed);
+}
+
+esp_err_t poison_chunk(uint64_t chunk_id)
+{
+    if (!s_mounted.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    Lock lock;
+    if (!lock.held()) {
+        return ESP_FAIL;
+    }
+    const uint64_t ts_ms = chunk_id >> 14;
+    const uint16_t seq = static_cast<uint16_t>(chunk_id & 0x3FFF);
+    char opus_leaf[FILENAME_BUF_LEN] = {0};
+    char poisoned_leaf[FILENAME_BUF_LEN] = {0};
+    if (!build_filename(ts_ms, seq, CHUNK_EXT, opus_leaf, sizeof(opus_leaf)) ||
+        !build_filename(ts_ms, seq, POISONED_EXT, poisoned_leaf, sizeof(poisoned_leaf))) {
+        return ESP_FAIL;
+    }
+    char opus_path[FULL_PATH_BUF_LEN] = {0};
+    char poisoned_path[FULL_PATH_BUF_LEN] = {0};
+    if (!build_full_path(opus_leaf, opus_path, sizeof(opus_path)) ||
+        !build_full_path(poisoned_leaf, poisoned_path, sizeof(poisoned_path))) {
+        return ESP_FAIL;
+    }
+    if (!LittleFS.exists(opus_path)) {
+        // Already poisoned (or already deleted). Idempotent success.
+        return ESP_OK;
+    }
+    if (!LittleFS.rename(opus_path, poisoned_path)) {
+        return ESP_FAIL;
+    }
+    if (s_pending_count.load(std::memory_order_relaxed) > 0) {
+        s_pending_count.fetch_sub(1, std::memory_order_relaxed);
+    }
+    s_poisoned_count.fetch_add(1, std::memory_order_relaxed);
+    return ESP_OK;
 }
 
 } // namespace pai_storage
