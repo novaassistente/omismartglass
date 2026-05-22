@@ -112,6 +112,19 @@ static size_t s_auth_fail_ring_idx = 0;
 // Lives in .bss to avoid per-cycle heap thrash.
 static uint8_t s_chunk_buf[pai_storage::CHUNK_MAX_BYTES];
 
+// File-scope HTTPS client + HTTPClient singletons (C#5 mitigation). The
+// upload task is single-threaded, so these are safely shared across all
+// drains within a single boot. Hoisting them out of post_chunk_once means
+// the internal mbedtls SSL context + HTTPClient header buffers are
+// allocated/freed at most once per HTTP transaction (via http.end()) and
+// the C++ object lifecycle cost is paid at .bss init time, not per call.
+// Without this, retry storms (3 attempts × 3 chunks) thrashed heap with
+// ~9 fresh mbedtls SSL contexts in succession — long-uptime devices
+// eventually saw ESP_ERR_NO_MEM on TLS handshake.
+static WiFiClientSecure s_https_client;
+static HTTPClient s_http;
+static bool s_https_initialized = false;
+
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -291,29 +304,33 @@ static PostResult post_chunk_once(uint64_t chunk_id, const uint8_t *body, size_t
     char sig_hex[65] = {0};
     hex_upper(sig, 32, sig_hex);
 
-    // HTTPS client. Pinned to the GTS Root R4 cross-signed root that
-    // currently anchors *.futuretools.today via Cloudflare edge (see
-    // pai_certs.h for rotation policy + verification commands). Defense-
-    // in-depth: HMAC over body remains the actual auth at the application
-    // layer; TLS pinning closes the MITM gap that setInsecure() left open.
-    // WiFiClientSecure socket-level timeout: arduino-esp32's Stream::setTimeout
-    // unit is MILLISECONDS (matches HTTPClient::setTimeout).
-    WiFiClientSecure client;
-    client.setCACert(pai_certs::ROOT_CA_PEM);
-    client.setTimeout(HTTP_TIMEOUT_MS);
-
-    HTTPClient http;
-    http.setConnectTimeout(HTTP_TIMEOUT_MS);
-    http.setTimeout(HTTP_TIMEOUT_MS);
-    http.setReuse(false);
-    // Set UA via the dedicated setter BEFORE begin(): addHeader("User-Agent",..)
-    // after begin() is silently overridden by HTTPClient's internal _userAgent
-    // on some arduino-esp32 versions, which would let the default UA hit
-    // Cloudflare and trigger Bot Fight Mode 403/1010.
-    http.setUserAgent(USER_AGENT);
+    // One-time TLS client configuration. Pinned to GTS Root R4 (see
+    // pai_certs.h). Stays in effect across all subsequent transactions
+    // — setCACert reconfigures the trust anchor without re-allocating
+    // the mbedtls SSL context. Defense-in-depth: HMAC over body remains
+    // the actual auth at the application layer.
+    if (!s_https_initialized) {
+        s_https_client.setCACert(pai_certs::ROOT_CA_PEM);
+        // WiFiClientSecure socket-level timeout: arduino-esp32's
+        // Stream::setTimeout unit is MILLISECONDS (matches HTTPClient).
+        s_https_client.setTimeout(HTTP_TIMEOUT_MS);
+        s_http.setConnectTimeout(HTTP_TIMEOUT_MS);
+        s_http.setTimeout(HTTP_TIMEOUT_MS);
+        // setUserAgent BEFORE begin(): addHeader("User-Agent",..) after
+        // begin() is silently overridden by HTTPClient's internal
+        // _userAgent on some arduino-esp32 versions, which would let
+        // the default UA hit CF Bot Fight Mode (403/1010).
+        s_http.setUserAgent(USER_AGENT);
+        // setReuse(true) keeps the keep-alive socket between calls when
+        // the server agrees. uvicorn (the FastAPI server) honours HTTP/1.1
+        // keep-alive by default, so subsequent uploads in the same drain
+        // cycle skip the full TLS handshake — significant heap + CPU win.
+        s_http.setReuse(true);
+        s_https_initialized = true;
+    }
 
     const char *endpoint = (s_endpoint[0] != '\0') ? s_endpoint : DEFAULT_ENDPOINT;
-    if (!http.begin(client, endpoint)) {
+    if (!s_http.begin(s_https_client, endpoint)) {
         return PostResult::RETRYABLE;
     }
 
@@ -322,12 +339,12 @@ static PostResult post_chunk_once(uint64_t chunk_id, const uint8_t *body, size_t
     // HTTPClient::POST(uint8_t*, size_t).
     char chunk_id_str[32] = {0};
     snprintf(chunk_id_str, sizeof(chunk_id_str), "%llu", (unsigned long long) chunk_id);
-    http.addHeader("Content-Type", "application/octet-stream");
-    http.addHeader("X-Chunk-Id", chunk_id_str);
-    http.addHeader("X-HMAC-SHA256", sig_hex);
+    s_http.addHeader("Content-Type", "application/octet-stream");
+    s_http.addHeader("X-Chunk-Id", chunk_id_str);
+    s_http.addHeader("X-HMAC-SHA256", sig_hex);
 
-    int code = http.POST(const_cast<uint8_t *>(body), body_len);
-    http.end();
+    int code = s_http.POST(const_cast<uint8_t *>(body), body_len);
+    s_http.end();
 
     // Defense-in-depth: zero BOTH the hex and raw sig buffers on the stack
     // before return so a stack-dump tool can't recover the secret from frame
