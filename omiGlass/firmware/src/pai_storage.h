@@ -78,7 +78,9 @@ namespace pai_storage
 // (pai_rec, s2.5) MUST rotate at the SMALLER of these two thresholds.
 static constexpr size_t CHUNK_CAP_BYTES = 4u * 1024u * 1024u;     // D4 primary
 static constexpr uint32_t CHUNK_ROTATE_INTERVAL_MS = 60u * 1000u; // D5 interval
-static constexpr size_t CHUNK_ROTATE_BYTES = 16u * 1024u;         // D5 reconciled to CHUNK_MAX_BYTES
+static constexpr size_t CHUNK_ROTATE_BYTES =
+    48u * 1024u; // bumped 16K→48K: ~3x fewer rotations → fewer LittleFS metadata commits/block-erases (cache-off SPI
+                 // ops that stall core-0 → TG1 interrupt WDT on this WiFi-active build)
 
 // Defense-in-depth: count cap (D4 secondary). At 4 s/chunk × 256 chunks ≈
 // 17 min of buffered audio in the worst case. Bytes cap usually trips first.
@@ -92,7 +94,8 @@ static constexpr uint8_t CHUNK_CAP_FREE_PCT = 20;
 // Hard upper bound for a single chunk payload. Sized for ~4 s of Opus at
 // 24 kbps + framing overhead. Caller is responsible for splitting larger
 // inputs across multiple chunks.
-static constexpr size_t CHUNK_MAX_BYTES = 16 * 1024;
+static constexpr size_t CHUNK_MAX_BYTES =
+    48 * 1024; // == CHUNK_ROTATE_BYTES (sized up to cut chunk-write frequency; flash-stall WDT mitigation)
 
 // Mount /littlefs. On first mount failure the partition is formatted and
 // mount is retried exactly once (premortem S2-P1 recovery). Orphan .tmp

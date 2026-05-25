@@ -604,8 +604,10 @@ static void upload_task(void * /*arg*/)
     // self-paced by definition.
     for (;;) {
         xSemaphoreTake(s_boost_sem, pdMS_TO_TICKS(s_tick_ms));
-        // Final guard before drain: still associated?
-        if (pai_wifi::is_connected()) {
+        // Final guard before drain: connected AND a valid IP assigned. The L2
+        // CONNECTED state can briefly precede a usable DHCP/DNS lease; gating on
+        // is_got_ip() too prevents the first POST from hitting "DNS Failed".
+        if (pai_wifi::is_connected() && pai_wifi::is_got_ip()) {
             drain_available_chunks();
         }
     }

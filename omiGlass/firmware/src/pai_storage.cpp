@@ -32,7 +32,10 @@ namespace
 // -----------------------------------------------------------------------------
 constexpr const char *MOUNT_POINT = "/littlefs";
 constexpr const char *PARTITION_LABEL = "littlefs";
-constexpr const char *CHUNKS_DIR = "/littlefs/chunks";
+// Relative to MOUNT_POINT — the arduino-esp32 LittleFS object prepends the
+// mountpoint ("/littlefs") to every path, so this must NOT include it or paths
+// resolve to "/littlefs/littlefs/chunks" and mkdir/open fail.
+constexpr const char *CHUNKS_DIR = "/chunks";
 constexpr const char *CHUNK_EXT = ".opus";
 constexpr const char *TMP_EXT = ".tmp";
 constexpr const char *POISONED_EXT = ".poisoned";
@@ -41,7 +44,7 @@ constexpr size_t MAX_OPEN_FILES = 5;
 // Filename schema: <unix_ms_zero_padded_13>_<seq_4digits>.opus
 //   "0000123456789_0000.opus"  → 13 + 1 + 4 + 5 = 23 bytes + NUL
 constexpr size_t FILENAME_BUF_LEN = 32;
-constexpr size_t FULL_PATH_BUF_LEN = 64; // "/littlefs/chunks/" + FILENAME
+constexpr size_t FULL_PATH_BUF_LEN = 64; // "/chunks/" + FILENAME (relative path)
 
 // -----------------------------------------------------------------------------
 // Shared state — protected by s_mutex
@@ -587,7 +590,9 @@ esp_err_t chunk_write(const uint8_t *buf, size_t len, uint64_t *out_chunk_id)
         return ESP_FAIL;
     }
     size_t written = f.write(buf, len);
-    f.flush();
+    // No explicit flush(): close() already syncs the LittleFS file. The extra
+    // flush forced a second metadata commit per chunk, and each commit is a
+    // cache-disabled SPI-flash op that stalls core-0 interrupts (TG1 WDT).
     f.close();
     if (written != len) {
         // Partial write — most likely filesystem full despite eviction (e.g.

@@ -834,8 +834,30 @@ void setup_app()
     setCpuFrequencyMhz(NORMAL_CPU_FREQ_MHZ);
     lastActivity = millis();
 
+#if !PAI_UPLOAD_MODE
+    // BLE is fully disabled in upload mode. Bringing up the BT controller
+    // alongside WiFi STA forces WiFi+BT coexistence on core 0, which starves
+    // IDLE0 (-> TG1WDT_SYS_RST reboots) and flaps the WiFi association
+    // (AP_NOT_FOUND). The IDF even aborts ("Should enable WiFi modem sleep
+    // when both WiFi and Bluetooth are enabled"). This device only needs the
+    // WiFi upload path, so we never start BLEDevice/NimBLE/GATT/advertising.
+    // All runtime BLE characteristic writes self-skip because `connected`
+    // never becomes true (ServerHandler::onConnect can't fire without
+    // advertising) and the characteristic pointers stay nullptr.
     configure_ble();
+#else
+    Serial.println("[BLE] disabled (PAI_UPLOAD_MODE=1) — WiFi-only, no BT coexistence");
+#endif
+#if !PAI_UPLOAD_MODE
     configure_camera();
+#else
+    // Camera unused in audio-only upload mode: every frame-buffer consumer is
+    // gated on the BLE `connected` flag, which never goes true with BLE off.
+    // Leaving esp_camera_init() running keeps XCLK/DMA/PSRAM active and
+    // contends with the WiFi stack on core 0, tripping the interrupt watchdog
+    // (TG1WDT_SYS_RST) once the link comes up. Same coexistence class as BLE.
+    Serial.println("[CAM] disabled (PAI_UPLOAD_MODE=1) — audio-only, no camera");
+#endif
 
     // Allocate buffer for photo chunks (200 bytes + 2 for frame index)
     s_compressed_frame_2 = (uint8_t *) ps_calloc(202, sizeof(uint8_t));
@@ -845,6 +867,7 @@ void setup_app()
         Serial.println("Chunk buffer allocated successfully.");
     }
 
+#if !PAI_UPLOAD_MODE
     // Set default capture interval from config
     isCapturingPhotos = true;
     captureInterval = PHOTO_CAPTURE_INTERVAL_MS;
@@ -852,6 +875,7 @@ void setup_app()
     Serial.print("Default capture interval set to ");
     Serial.print(PHOTO_CAPTURE_INTERVAL_MS / 1000);
     Serial.println(" seconds.");
+#endif
 
     // Initial battery reading
     // Battery voltage divider
@@ -1064,7 +1088,10 @@ void loop_app()
     //     across the sleep window.
     bool s3_idle = true;
 #if PAI_UPLOAD_MODE
-    s3_idle = !pai_upload::is_busy() && pai_rec::bytes_pending() == 0;
+    // Never light-sleep while WiFi is associated: esp_light_sleep_start()
+    // gates the modem and races the WiFi driver/BLE coexistence on core 0,
+    // producing stale associations (AP_NOT_FOUND) and coexistence stalls.
+    s3_idle = !pai_upload::is_busy() && pai_rec::bytes_pending() == 0 && !pai_wifi::is_connected();
 #endif
     if (!photoDataUploading && !audioSubscribed && s3_idle) {
         enableLightSleep();

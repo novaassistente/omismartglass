@@ -11,16 +11,14 @@
 
 #include "pai_wifi.h"
 
-#include "pai_nvs.h"
-
 #include <Arduino.h>
+
+#include "pai_nvs.h"
 // Arduino's esp32-hal-gpio.h defines DISABLED as a macro. Undef it BEFORE any
 // further headers re-pull it in so our State::PAUSED enum stays clean.
 #ifdef DISABLED
 #undef DISABLED
 #endif
-#include <algorithm>
-#include <atomic>
 #include <esp_event.h>
 #include <esp_mac.h>
 #include <esp_netif.h>
@@ -30,6 +28,9 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <string.h>
+
+#include <algorithm>
+#include <atomic>
 
 namespace pai_wifi
 {
@@ -256,14 +257,16 @@ bool try_profile(uint8_t idx)
     }
 
     // Wait for GOT_IP (success) or DISCONNECTED (fail) up to CONNECT_TIMEOUT_MS.
-    EventBits_t bits = xEventGroupWaitBits(s_events, BIT_GOT_IP | BIT_DISCONNECTED, pdTRUE, pdFALSE,
-                                           pdMS_TO_TICKS(CONNECT_TIMEOUT_MS));
+    EventBits_t bits = xEventGroupWaitBits(
+        s_events, BIT_GOT_IP | BIT_DISCONNECTED, pdTRUE, pdFALSE, pdMS_TO_TICKS(CONNECT_TIMEOUT_MS));
 
     if (bits & BIT_GOT_IP) {
         // SSID is intentionally absent from this log. idx allows operator to
         // correlate without exposing the AP name.
         IPAddress ip(s_ip_raw.load(std::memory_order_relaxed));
-        Serial.printf("[WIFI] connected idx=%u ip=%s rssi=%d\n", (unsigned) idx, ip.toString().c_str(),
+        Serial.printf("[WIFI] connected idx=%u ip=%s rssi=%d\n",
+                      (unsigned) idx,
+                      ip.toString().c_str(),
                       (int) s_rssi.load(std::memory_order_relaxed));
         set_state(State::CONNECTED);
         return true;
@@ -304,8 +307,8 @@ void task_main(void *arg)
         // If we were connected and lost the link, wait for the disconnect
         // signal then attempt immediate reconnect of the active profile.
         if (was_connected) {
-            EventBits_t b = xEventGroupWaitBits(s_events, BIT_DISCONNECTED | BIT_PAUSE_REQ, pdTRUE, pdFALSE,
-                                                portMAX_DELAY);
+            EventBits_t b =
+                xEventGroupWaitBits(s_events, BIT_DISCONNECTED | BIT_PAUSE_REQ, pdTRUE, pdFALSE, portMAX_DELAY);
             if (b & BIT_PAUSE_REQ) {
                 s_paused = true;
                 continue;
@@ -397,6 +400,17 @@ esp_err_t begin()
         return err;
     }
 
+    // Create the event group + scan mutex BEFORE registering handlers or
+    // starting the driver. A WIFI/IP event can fire the instant esp_wifi_start()
+    // runs and reach wifi_event_handler()'s xEventGroupSetBits() — if s_events
+    // is still nullptr there, configASSERT() aborts (init-ordering race).
+    s_events = xEventGroupCreate();
+    s_scan_mutex = xSemaphoreCreateMutex();
+    if (s_events == nullptr || s_scan_mutex == nullptr) {
+        Serial.println("[WIFI] event/mutex alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
     err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, nullptr, nullptr);
     if (err != ESP_OK) {
         Serial.printf("[WIFI] handler reg wifi err=0x%x\n", err);
@@ -424,18 +438,24 @@ esp_err_t begin()
         return err;
     }
 
-    // Modem sleep for power budget.
+#if PAI_UPLOAD_MODE
+    // BLE is disabled in upload mode, so the WiFi+BT coexistence rule (which
+    // forces modem sleep) no longer applies. Disable modem sleep: at marginal
+    // RSSI, MIN_MODEM was missing DTIM beacons → AP_NOT_FOUND reconnect storms,
+    // and the PM radio power-state transitions are a suspected source of long
+    // interrupts-disabled windows (TG1WDT_SYS_RST). Costs ~15-20 mA.
+    esp_wifi_set_ps(WIFI_PS_NONE);
+#else
+    // Modem sleep is MANDATORY when Bluetooth is also enabled — the IDF
+    // coexistence layer aborts otherwise.
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+#endif
 
-    s_events = xEventGroupCreate();
-    s_scan_mutex = xSemaphoreCreateMutex();
-    if (s_events == nullptr || s_scan_mutex == nullptr) {
-        Serial.println("[WIFI] event/mutex alloc failed");
-        return ESP_ERR_NO_MEM;
-    }
+    // NB: s_events / s_scan_mutex are created earlier (before handler
+    // registration + esp_wifi_start) to avoid an init-ordering race.
 
-    BaseType_t ok = xTaskCreatePinnedToCore(task_main, "pai_wifi", TASK_STACK_BYTES, nullptr, TASK_PRIORITY, &s_task,
-                                            TASK_CORE);
+    BaseType_t ok =
+        xTaskCreatePinnedToCore(task_main, "pai_wifi", TASK_STACK_BYTES, nullptr, TASK_PRIORITY, &s_task, TASK_CORE);
     if (ok != pdPASS) {
         Serial.println("[WIFI] task create failed");
         return ESP_ERR_NO_MEM;
@@ -476,6 +496,14 @@ State get_state()
 bool is_connected()
 {
     return get_state() == State::CONNECTED;
+}
+
+bool is_got_ip()
+{
+    // A non-zero IP is only ever published from IP_EVENT_STA_GOT_IP (set_ip in
+    // the event handler), so a valid IP implies DHCP completed. Cleared to 0 on
+    // disconnect. Atomic aligned load — see get_ip() comment.
+    return s_ip_raw.load(std::memory_order_relaxed) != 0;
 }
 
 IPAddress get_ip()
@@ -542,7 +570,8 @@ std::vector<std::pair<std::string, int8_t>> scan_blocking(uint32_t timeout_ms)
             out.emplace_back(std::string((const char *) records[i].ssid), records[i].rssi);
         }
         // Sort by RSSI descending.
-        std::sort(out.begin(), out.end(),
+        std::sort(out.begin(),
+                  out.end(),
                   [](const std::pair<std::string, int8_t> &a, const std::pair<std::string, int8_t> &b) {
                       return a.second > b.second;
                   });

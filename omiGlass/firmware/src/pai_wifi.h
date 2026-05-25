@@ -24,9 +24,10 @@
 #ifndef PAI_WIFI_H
 #define PAI_WIFI_H
 
-#include <esp_err.h>
 #include <IPAddress.h>
+#include <esp_err.h>
 #include <stdint.h>
+
 #include <string>
 #include <utility>
 #include <vector>
@@ -67,6 +68,11 @@ State get_state();
 
 // Quick connectivity check. True only while CONNECTED.
 bool is_connected();
+
+// True once a valid IPv4 address has been assigned (IP_EVENT_STA_GOT_IP).
+// Stronger than is_connected() for callers that must wait for DHCP/DNS to be
+// usable before issuing sockets — guards against the "DNS Failed" first POST.
+bool is_got_ip();
 
 // IP address (0.0.0.0 if not connected).
 IPAddress get_ip();
