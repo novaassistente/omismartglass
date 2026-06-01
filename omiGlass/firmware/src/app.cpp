@@ -339,7 +339,7 @@ void onOpusEncoded(uint8_t *data, size_t len)
     // two early-return paths (oversize frame, ring buffer full when phone
     // is disconnected) that would silently kill the persistent recording
     // exactly when the offline buffer matters most.
-#if PAI_UPLOAD_MODE
+#if (PAI_UPLOAD_MODE || PAI_RELAY_MODE)
     pai_rec::feed_opus_frame(data, len);
 #endif
 
@@ -433,6 +433,21 @@ void processAudioTx()
 // -------------------------------------------------------------------------
 // BLE Callbacks
 // -------------------------------------------------------------------------
+#if PAI_RELAY_MODE
+#include "pai_ble_relay.h"
+
+// ACK characteristic (phone -> pendant): routes the 9-byte ack frame to the
+// relay module so it can delete the matching chunk after the phone's server 2xx.
+class RelayAckCallback : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *c) override
+    {
+        std::string v = c->getValue();
+        pai_ble_relay::on_ack(reinterpret_cast<const uint8_t *>(v.data()), v.length());
+    }
+};
+#endif
+
 class ServerHandler : public BLEServerCallbacks
 {
     void onConnect(BLEServer *server) override
@@ -441,6 +456,9 @@ class ServerHandler : public BLEServerCallbacks
         audioSubscribed = false;
         lastActivity = millis(); // Register activity - prevents sleep
         Serial.println(">>> BLE Client connected.");
+#if PAI_RELAY_MODE
+        pai_ble_relay::on_connect();
+#endif
         // Send current battery level on connect
         updateBatteryService();
     }
@@ -449,8 +467,20 @@ class ServerHandler : public BLEServerCallbacks
         connected = false;
         audioSubscribed = false;
         Serial.println("<<< BLE Client disconnected. Restarting advertising.");
+#if PAI_RELAY_MODE
+        pai_ble_relay::on_disconnect();
+#endif
         BLEDevice::startAdvertising();
     }
+#if PAI_RELAY_MODE
+    // Capture the negotiated ATT MTU so the relay can size its fragments
+    // (usable payload = MTU - 3). Bluedroid fires this after the central's
+    // MTU-exchange request.
+    void onMtuChanged(BLEServer *server, esp_ble_gatts_cb_param_t *param) override
+    {
+        pai_ble_relay::on_mtu(param->mtu.mtu);
+    }
+#endif
 };
 
 // Callback for Audio Data CCCD (Client Characteristic Configuration Descriptor)
@@ -602,6 +632,7 @@ void configure_ble()
 {
     Serial.println("Initializing BLE...");
     BLEDevice::init(BLE_DEVICE_NAME);
+    BLEDevice::setMTU(BLE_MTU_SIZE); // accept up to 517; central requests, we honor
     BLEServer *server = BLEDevice::createServer();
     server->setCallbacks(new ServerHandler());
 
@@ -690,15 +721,41 @@ void configure_ble()
     // Set OTA characteristics for the OTA module
     ota_set_characteristics(otaControlCharacteristic, otaDataCharacteristic);
 
+#if PAI_RELAY_MODE
+    // ---- PAI relay service (chunk drain over BLE -> phone) ----
+    BLEService *relayService = server->createService(PAI_RELAY_SERVICE_UUID);
+    BLECharacteristic *relayChunkChar =
+        relayService->createCharacteristic(PAI_RELAY_CHUNK_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    BLE2902 *relayCcc = new BLE2902();
+    relayCcc->setNotifications(true);
+    relayChunkChar->addDescriptor(relayCcc);
+    BLECharacteristic *relayAckChar =
+        relayService->createCharacteristic(PAI_RELAY_ACK_UUID, BLECharacteristic::PROPERTY_WRITE);
+    relayAckChar->setCallbacks(new RelayAckCallback());
+    BLECharacteristic *relayStatusChar =
+        relayService->createCharacteristic(PAI_RELAY_STATUS_UUID, BLECharacteristic::PROPERTY_READ);
+    relayStatusChar->setValue("PENDANT-NOVA RELAY " __DATE__ " " __TIME__);
+    (void) relayStatusChar; // read-only diagnostics for the phone; firmware keeps no ref
+    pai_ble_relay::register_characteristics(relayChunkChar, relayAckChar);
+#endif
+
     // Start services
     service->start();
     batteryService->start();
     deviceInfoService->start();
     otaService->start();
+#if PAI_RELAY_MODE
+    relayService->start();
+#endif
 
     // Start advertising
     BLEAdvertising *advertising = BLEDevice::getAdvertising();
+#if PAI_RELAY_MODE
+    // Advertise the relay service as primary so the phone app filters on it.
+    advertising->addServiceUUID(relayService->getUUID());
+#else
     advertising->addServiceUUID(service->getUUID()); // Main service (fits in 31 bytes)
+#endif
     advertising->setScanResponse(true);
     advertising->setMinPreferred(BLE_ADV_MIN_INTERVAL);
     advertising->setMaxPreferred(BLE_ADV_MAX_INTERVAL);
@@ -816,6 +873,10 @@ void setup_app()
 {
     Serial.begin(921600);
     Serial.println("Setup started...");
+#if PAI_RELAY_MODE
+    Serial.println("=== PENDANT NOVA :: BLE-RELAY BUILD :: transport=GATT-pipe wifi=GATED ===");
+    Serial.printf("=== RELAY svc=%s build=%s %s ===\n", PAI_RELAY_SERVICE_UUID, __DATE__, __TIME__);
+#endif
 
     // Initialize GPIO
     pinMode(POWER_BUTTON_PIN, INPUT_PULLUP);
@@ -848,15 +909,14 @@ void setup_app()
 #else
     Serial.println("[BLE] disabled (PAI_UPLOAD_MODE=1) — WiFi-only, no BT coexistence");
 #endif
-#if !PAI_UPLOAD_MODE
+#if PAI_CAMERA_ENABLED
     configure_camera();
 #else
-    // Camera unused in audio-only upload mode: every frame-buffer consumer is
-    // gated on the BLE `connected` flag, which never goes true with BLE off.
-    // Leaving esp_camera_init() running keeps XCLK/DMA/PSRAM active and
-    // contends with the WiFi stack on core 0, tripping the interrupt watchdog
-    // (TG1WDT_SYS_RST) once the link comes up. Same coexistence class as BLE.
-    Serial.println("[CAM] disabled (PAI_UPLOAD_MODE=1) — audio-only, no camera");
+    // Camera split off the transport flag (was !PAI_UPLOAD_MODE). The audio
+    // relay pendant runs camera OFF — every frame-buffer consumer is gated on
+    // the BLE `connected`+photo path, and leaving esp_camera_init() running
+    // keeps XCLK/DMA/PSRAM active for no reason.
+    Serial.println("[CAM] disabled (PAI_CAMERA_ENABLED=0) — audio-only, no camera");
 #endif
 
     // Allocate buffer for photo chunks (200 bytes + 2 for frame index)
@@ -867,7 +927,7 @@ void setup_app()
         Serial.println("Chunk buffer allocated successfully.");
     }
 
-#if !PAI_UPLOAD_MODE
+#if PAI_CAMERA_ENABLED
     // Set default capture interval from config
     isCapturingPhotos = true;
     captureInterval = PHOTO_CAPTURE_INTERVAL_MS;
@@ -939,6 +999,26 @@ void setup_app()
     pai_upload::start_task();
     Serial.println("[UPLOAD] pai_upload task started (core 0)");
 #endif
+
+#if PAI_RELAY_MODE
+    // BLE-relay transport bring-up. No WiFi — chunks drain over GATT to the
+    // phone (pai_ble_relay), which forwards them over cellular. Mirrors the
+    // upload bring-up ordering (NVS -> storage -> rec) so REC behavior is
+    // identical; only the drain transport differs.
+    pai_nvs::begin();
+    esp_err_t storage_err = pai_storage::begin();
+    if (storage_err == ESP_OK) {
+        Serial.printf("[STORAGE] OK pending=%u evicted_lifetime=%u\n",
+                      (unsigned) pai_storage::chunks_pending_count(),
+                      (unsigned) pai_storage::chunks_evicted_lifetime());
+    } else {
+        Serial.printf("[STORAGE] mount failed err=0x%x\n", storage_err);
+    }
+    pai_rec::init();
+    Serial.println("[REC] pai_rec init OK");
+    pai_ble_relay::start_task();
+    Serial.println("[RELAY] pai_ble_relay task started (core 0)");
+#endif
 }
 
 void loop_app()
@@ -963,7 +1043,7 @@ void loop_app()
     // REC ticker — drives time-based chunk rotation (CHUNK_ROTATE_INTERVAL_MS)
     // independent of frame arrival rate. Wraps safely past millis() wrap at 49d.
     // Gated on PAI_UPLOAD_MODE to keep BLE-only builds at zero overhead.
-#if PAI_UPLOAD_MODE
+#if (PAI_UPLOAD_MODE || PAI_RELAY_MODE)
     pai_rec::tick_ms((uint32_t) now);
 #endif
 
@@ -1092,6 +1172,11 @@ void loop_app()
     // gates the modem and races the WiFi driver/BLE coexistence on core 0,
     // producing stale associations (AP_NOT_FOUND) and coexistence stalls.
     s3_idle = !pai_upload::is_busy() && pai_rec::bytes_pending() == 0 && !pai_wifi::is_connected();
+#endif
+#if PAI_RELAY_MODE
+    // Never light-sleep mid-chunk: a sleep that overruns the 8 s BLE supervision
+    // timeout drops the link and forces a retransmit. Also keep REC flushing.
+    s3_idle = !pai_ble_relay::is_busy() && pai_rec::bytes_pending() == 0;
 #endif
     if (!photoDataUploading && !audioSubscribed && s3_idle) {
         enableLightSleep();

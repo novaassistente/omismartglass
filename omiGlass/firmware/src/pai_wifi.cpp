@@ -199,6 +199,22 @@ void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
             set_rssi(ap.rssi);
         }
+
+        // Pin reliable public DNS. Phone hotspots / extenders frequently hand
+        // out a broken or slow resolver via DHCP, so HTTPClient's hostByName()
+        // times out. A timed-out lookup whose UDP response then lands late
+        // crashes arduino-esp32 (wifi_dns_found_callback -> xEventGroupSetBits on
+        // a stale handle, event_groups.c assert). Forcing 8.8.8.8/1.1.1.1 makes
+        // resolution fast+reliable and sidesteps that race entirely.
+        if (ev->esp_netif) {
+            esp_netif_dns_info_t d = {};
+            d.ip.type = ESP_IPADDR_TYPE_V4;
+            d.ip.u_addr.ip4.addr = esp_ip4addr_aton("8.8.8.8");
+            esp_netif_set_dns_info(ev->esp_netif, ESP_NETIF_DNS_MAIN, &d);
+            d.ip.u_addr.ip4.addr = esp_ip4addr_aton("1.1.1.1");
+            esp_netif_set_dns_info(ev->esp_netif, ESP_NETIF_DNS_BACKUP, &d);
+        }
+
         xEventGroupSetBits(s_events, BIT_GOT_IP);
     }
 }
@@ -233,6 +249,10 @@ bool try_profile(uint8_t idx)
     wcfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     wcfg.sta.pmf_cfg.capable = true;
     wcfg.sta.pmf_cfg.required = false;
+    // WPA3-SAE networks (incl. WPA2/WPA3 transition + most Android hotspots)
+    // require H2E password-element derivation. Default (UNSPECIFIED) only does
+    // hunt-and-peck → AUTH_FAILED on H2E-only APs. BOTH keeps WPA2 working.
+    wcfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
     // Wipe local copies BEFORE handing off to the driver. The driver keeps
     // its own copy internally (we can't help that), but at least our stack

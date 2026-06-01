@@ -9,10 +9,32 @@
 // Set to 0 to restore upstream cloud-app compatibility.
 #define PAI_LOCAL_MODE 1
 
-// PAI_UPLOAD_MODE: enable WiFi STA for chunk upload. Default 1.
-// Set to 0 to compile BLE-only firmware (dev/debug).
+// =============================================================================
+// PAI TRANSPORT SELECTION — exactly one drain transport for audio chunks.
+// =============================================================================
+// PAI_RELAY_MODE 1 → BLE-relay to phone (DEFAULT). Chunks drain over a GATT
+// notify characteristic to a companion phone app that forwards them to the
+// ingest server over cellular. No WiFi STA, no on-device TLS. This removes the
+// arduino-esp32 WiFi DNS-callback crash class entirely. WiFi source is retained
+// (pai_wifi.*/pai_upload.*) but is never invoked while relay mode is on.
+#ifndef PAI_RELAY_MODE
+#define PAI_RELAY_MODE 1
+#endif
+
+// PAI_UPLOAD_MODE: WiFi STA + HTTPS chunk upload. DERIVED — off whenever relay
+// mode is on. (Set PAI_RELAY_MODE 0 to fall back to the WiFi upload transport.)
 #ifndef PAI_UPLOAD_MODE
+#if PAI_RELAY_MODE
+#define PAI_UPLOAD_MODE 0
+#else
 #define PAI_UPLOAD_MODE 1
+#endif
+#endif
+
+// PAI_CAMERA_ENABLED: split off the transport flag (the camera path used to
+// piggyback on !PAI_UPLOAD_MODE). The audio relay pendant runs camera OFF.
+#ifndef PAI_CAMERA_ENABLED
+#define PAI_CAMERA_ENABLED 0
 #endif
 
 // =============================================================================
@@ -148,16 +170,16 @@ typedef enum {
 // =============================================================================
 // OPUS CODEC CONFIGURATION
 // =============================================================================
-#define AUDIO_CODEC_ID 21              // Opus codec ID (matches Omi protocol)
-#define OPUS_FRAME_SAMPLES 320         // 20ms frame @ 16kHz
-#define OPUS_OUTPUT_MAX_BYTES 160      // Max encoded frame size
-#define OPUS_BITRATE 32000             // 32kbps
-#define OPUS_COMPLEXITY 3              // Encoding complexity (1-10)
-#define OPUS_VBR 1                     // Variable bitrate enabled
+#define AUDIO_CODEC_ID 21         // Opus codec ID (matches Omi protocol)
+#define OPUS_FRAME_SAMPLES 320    // 20ms frame @ 16kHz
+#define OPUS_OUTPUT_MAX_BYTES 160 // Max encoded frame size
+#define OPUS_BITRATE 32000        // 32kbps
+#define OPUS_COMPLEXITY 3         // Encoding complexity (1-10)
+#define OPUS_VBR 1                // Variable bitrate enabled
 
 // Audio BLE packet configuration
-#define AUDIO_PACKET_HEADER_SIZE 3     // 2 bytes index + 1 byte sub-index
-#define AUDIO_TX_RING_BUFFER_SIZE 16   // Number of encoded frames to buffer
+#define AUDIO_PACKET_HEADER_SIZE 3   // 2 bytes index + 1 byte sub-index
+#define AUDIO_TX_RING_BUFFER_SIZE 16 // Number of encoded frames to buffer
 
 // =============================================================================
 // BLE UUID DEFINITIONS - OMI Protocol
@@ -172,34 +194,41 @@ typedef enum {
 #define BATTERY_SERVICE_UUID (uint16_t) 0x180F
 #define BATTERY_LEVEL_UUID (uint16_t) 0x2A19
 
+// PAI relay service — fresh random 128-bit base (NOT the OMI base) so the relay
+// is unambiguous to a sniffer and never collides with the OMI audio/photo svc.
+#define PAI_RELAY_SERVICE_UUID "6e5d0001-7c3a-4e6c-9a11-2b9f4d0ce701"
+#define PAI_RELAY_CHUNK_UUID "6e5d0002-7c3a-4e6c-9a11-2b9f4d0ce701"  // notify: pendant -> phone
+#define PAI_RELAY_ACK_UUID "6e5d0003-7c3a-4e6c-9a11-2b9f4d0ce701"    // write:  phone -> pendant
+#define PAI_RELAY_STATUS_UUID "6e5d0004-7c3a-4e6c-9a11-2b9f4d0ce701" // read:   build marker / diag
+
 // OTA Service UUIDs
 #define OTA_SERVICE_UUID "19B10010-E8F2-537E-4F6C-D104768A1214"
-#define OTA_CONTROL_UUID "19B10011-E8F2-537E-4F6C-D104768A1214"  // Write commands, read status
-#define OTA_DATA_UUID "19B10012-E8F2-537E-4F6C-D104768A1214"     // Notifications for progress
+#define OTA_CONTROL_UUID "19B10011-E8F2-537E-4F6C-D104768A1214" // Write commands, read status
+#define OTA_DATA_UUID "19B10012-E8F2-537E-4F6C-D104768A1214"    // Notifications for progress
 
 // OTA Commands (written to OTA_CONTROL_UUID)
-#define OTA_CMD_SET_WIFI 0x01       // Set WiFi credentials: [cmd, ssid_len, ssid..., pass_len, pass...]
-#define OTA_CMD_START_OTA 0x02      // Start OTA update: [cmd, url_len, url...]
-#define OTA_CMD_CANCEL_OTA 0x03     // Cancel ongoing OTA
-#define OTA_CMD_GET_STATUS 0x04     // Request current status
-#define OTA_CMD_SET_URL 0x05        // Set firmware URL: [cmd, url_len, url...]
+#define OTA_CMD_SET_WIFI 0x01   // Set WiFi credentials: [cmd, ssid_len, ssid..., pass_len, pass...]
+#define OTA_CMD_START_OTA 0x02  // Start OTA update: [cmd, url_len, url...]
+#define OTA_CMD_CANCEL_OTA 0x03 // Cancel ongoing OTA
+#define OTA_CMD_GET_STATUS 0x04 // Request current status
+#define OTA_CMD_SET_URL 0x05    // Set firmware URL: [cmd, url_len, url...]
 
 // OTA Status codes (notified via OTA_DATA_UUID)
 #define OTA_STATUS_IDLE 0x00
 #define OTA_STATUS_WIFI_CONNECTING 0x10
 #define OTA_STATUS_WIFI_CONNECTED 0x11
 #define OTA_STATUS_WIFI_FAILED 0x12
-#define OTA_STATUS_DOWNLOADING 0x20      // Followed by progress byte (0-100)
+#define OTA_STATUS_DOWNLOADING 0x20 // Followed by progress byte (0-100)
 #define OTA_STATUS_DOWNLOAD_COMPLETE 0x21
 #define OTA_STATUS_DOWNLOAD_FAILED 0x22
-#define OTA_STATUS_INSTALLING 0x30       // Followed by progress byte (0-100)
+#define OTA_STATUS_INSTALLING 0x30 // Followed by progress byte (0-100)
 #define OTA_STATUS_INSTALL_COMPLETE 0x31
 #define OTA_STATUS_INSTALL_FAILED 0x32
 #define OTA_STATUS_REBOOTING 0x40
 #define OTA_STATUS_ERROR 0xFF
 
 // WiFi Configuration
-#define WIFI_CONNECT_TIMEOUT_MS 15000    // 15 seconds to connect
+#define WIFI_CONNECT_TIMEOUT_MS 15000 // 15 seconds to connect
 #define WIFI_MAX_SSID_LEN 32
 #define WIFI_MAX_PASS_LEN 64
 #define OTA_MAX_URL_LEN 256
